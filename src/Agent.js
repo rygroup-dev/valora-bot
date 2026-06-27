@@ -7,14 +7,20 @@ import { Auth } from './auth/Auth.js';
 import { RoomClient } from './net/RoomClient.js';
 import { Safety } from './safety/Safety.js';
 import { SaveManager } from './state/SaveManager.js';
-import { snapshot, freeNodes } from './game/world.js';
+import { snapshot } from './game/world.js';
 import { pickTarget } from './game/combat.js';
 import { decideActivity } from './brain/Brain.js';
 import { bestLoadout, planStatAllocation } from './game/progression.js';
 import { orderShardCandidates } from './util/shards.js';
-import { humanDelay, sleep } from './util/timing.js';
+import { humanDelay, sleep, jitter } from './util/timing.js';
 import { fetchTokenBalance } from './net/balance.js';
 import { VALORA, tokenGuide } from './game/valora.js';
+import { loadMapData } from './game/mapLoader.js';
+import { nextStarterAction } from './game/starter.js';
+
+const TOOL_ITEMS = ['bucheron_axe', 'fishing_rod', 'mining_pick', 'paysan_sickle'];
+// Which resource each tool can harvest.
+const TOOL_KIND = { bucheron_axe: 'wood', fishing_rod: 'fish', mining_pick: 'mineral', paysan_sickle: 'cereal' };
 
 const STAT_BUILD = { vitalite: 0.4, force: 0.4, adresse: 0.2 };
 const GEAR_WEIGHTS = { dmg: 2, pv: 1, force: 1.5, crit: 3, adresse: 1, pa: 5, pm: 4 };
@@ -42,6 +48,21 @@ export class Agent {
     this.events = [];
     this._lastLevel = null;
     this._lastGold = null;
+    this._seq = 0;
+    this._harvesting = new Set(); // cells we've started harvesting
+    this._busyHarvesting = false; // true while one harvest is in progress
+    this._harvestAt = 0;
+    this.mapData = null; // MapData for the current map (graph + spots)
+    this.heroCell = null; // our current cell
+    this.walking = false;
+    this.gatherKinds = ['wood', 'fish', 'mineral'];
+    this._disabledKinds = new Set(); // gather types we lack the tool for
+    this._blockedResources = new Set(); // resources too high-level for us
+    this._blockedCells = new Set(); // spot cells that keep denying
+    this._lastSpot = null;
+    // Combat is turn-based tactical; the fight AI is not built yet, so the bot
+    // does not auto-engage (avoids getting stuck / dying). Gather-first for now.
+    this.combatEnabled = false;
   }
 
   // Record an event in the ring buffer; optionally push a Telegram notification.
@@ -104,6 +125,17 @@ export class Agent {
     await this.room.connect();
     this.shardId = this.room.shardId;
 
+    // Load the current map (graph + gathering spots) for navigation.
+    this.mapId = this.character.save?.pos?.mapId || 'city';
+    this.heroCell = this.character.save?.pos?.cell ?? null;
+    try {
+      this.mapData = await loadMapData(this.config.base, this.mapId);
+      const spots = this.mapData.spots(this.gatherKinds).length;
+      this.log(`map ${this.mapId} loaded — ${spots} gather spots, ${this.mapData.portals().length} portals`);
+    } catch (e) {
+      this.log(`map load failed: ${e?.message}`);
+    }
+
     const shardInfo = shards.find((s) => s.id === this.shardId);
     const tier = shardInfo && shardInfo.minHold > 0 ? `👑 PRIORITY (hold ≥${shardInfo.minHold.toLocaleString()})` : 'standard';
     this.running = true;
@@ -116,24 +148,76 @@ export class Agent {
     const noop = () => {};
     this.room
       .on('econ_config', (m) => (this.econConfig = m))
+      .on('econ_result', (m) => {
+        this._applyView(m?.view);
+      })
       .on('hdv_config', (m) => (this.hdvConfig = m))
       .on('fee_config', (m) => (this.feeConfig = m))
       .on('stat_reset_config', (m) => (this.statResetConfig = m))
       .on('creature_config', noop)
       .on('time_config', noop)
       .on('spectate_config', noop)
-      .on('quest_sync', (m) => (this.questSync = m))
+      .on('quest_sync', (m) => {
+        this.questSync = m;
+        if (m?.book) this.questBook = m.book;
+        this._applyView(m?.view);
+      })
+      .on('quest_result', (m) => {
+        if (m?.book) this.questBook = m.book;
+        this._applyView(m?.view);
+        if (m?.ok) this._event(`📜 quest progress${m.questId ? ` (${m.questId})` : ''}`);
+      })
       .on('friend_list', noop)
       .on('hdv_listings', (m) => (this.lastListings = m))
       .on('chat', () => {})
       .on('chat_denied', () => {})
       .on('relocate', () => {})
-      .on('quest_result', () => {})
+      .on('harvest_started', (m) => {
+        // Server accepted the harvest; finish after the node's duration to collect.
+        const cell = m?.cell;
+        const sec = Number(m?.sec) || Number(m?.duration) || 3;
+        const ms = sec * 1000 + 350; // finish just after the cast completes
+        this._event(`🌿 harvesting cell ${cell} (${sec}s)…`);
+        setTimeout(() => {
+          if (this.safety.canWrite('harvest_finish').ok && this._harvesting.has(cell)) {
+            this.room.send('harvest_finish', { cell });
+          }
+        }, ms);
+      })
       .on('harvest_result', (m) => {
         this.safety.recordSuccess('harvest');
-        if (m?.xp || m?.drops) this._event(`🌿 harvested${m.xp ? ` +${m.xp}xp` : ''}`);
+        if (m?.cell != null) this._harvesting.delete(m.cell);
+        const drops = Array.isArray(m?.drops)
+          ? m.drops.map((d) => `${d.qty}× ${d.id}`).join(', ')
+          : '';
+        this._gathered = (this._gathered || 0) + 1;
+        this._busyHarvesting = false;
+        if (m?.cell != null) { this._harvesting.delete(m.cell); this._blockedCells.delete(m.cell); }
+        this._event(`🌿 harvested${m?.xp ? ` +${m.xp}xp` : ''}${drops ? ` (${drops})` : ''} [#${this._gathered}]`);
       })
-      .on('harvest_denied', () => this.safety.recordDenied('harvest'))
+      .on('harvest_denied', (m) => {
+        this._busyHarvesting = false;
+        if (m?.cell != null) this._harvesting.delete(m.cell);
+        this.safety.recordDenied('harvest');
+        const reason = m?.reason || JSON.stringify(m);
+        const spot = this._lastSpot;
+        if (reason === 'tool') {
+          // Genuinely no tool for this whole resource type → skip it (notify once).
+          const type = spot?.type;
+          if (type && !this._disabledKinds.has(type)) {
+            this._disabledKinds.add(type);
+            const tool = { wood: 'an axe', fish: 'a fishing rod', mineral: 'a pickaxe', cereal: 'a sickle' }[type] || 'a tool';
+            this._event(`⛔ can't gather ${type}: need ${tool} — skipping it.`, { notify: true });
+          }
+        } else if (reason === 'level' || reason === 'skill') {
+          // This particular resource is too high-level — skip it, try others (no spam).
+          if (spot?.resource) this._blockedResources.add(spot.resource);
+          if (spot?.cell != null) this._blockedCells.add(spot.cell);
+        } else {
+          // transient (range/not_busy/etc) — block this cell briefly, no notify
+          if (spot?.cell != null) this._blockedCells.add(spot.cell);
+        }
+      })
       .on('fightResult', (m) => {
         const won = m?.win ?? m?.won ?? m?.victory;
         this._event(won ? `⚔️ fight won${m?.xp ? ` +${m.xp}xp` : ''}` : '💀 fight lost', { notify: true });
@@ -158,6 +242,8 @@ export class Agent {
     const snap = this.room ? snapshot(this.room.state, this.room.room?.sessionId) : { self: null, mobs: [], nodes: [] };
     const p = this.character?.save?.player || {};
     const self = snap.self || {};
+    if (self.cell != null) this.heroCell = self.cell; // keep our position fresh
+    const canGather = !!this.mapData && this.mapData.spots(this._effectiveKinds()).length > 0;
     return {
       snap,
       player: {
@@ -178,8 +264,8 @@ export class Agent {
       quests: { actionable: (p.quests?.active || []).length > 0 },
       arena: { available: false },
       profit: {
-        combatValue: snap.mobs?.length ? 50 : 0,
-        gatherValue: freeNodes(this.room?.state).length ? 30 : 0,
+        combatValue: this.combatEnabled && snap.mobs?.length ? 50 : 0,
+        gatherValue: canGather ? 30 : 0,
         bestCraftProfit: 0,
       },
     };
@@ -203,6 +289,16 @@ export class Agent {
     }
     this._lastLevel = lvl;
     this._lastGold = gold;
+
+    // Starter quests come first — they grant the first gathering tool, which
+    // unlocks the whole economy. Run until the chain is done & we have a tool.
+    const starter = this._starterAction();
+    if (starter) {
+      if (starter.type !== this.lastActivity) this._event(`🧭 starter: ${starter.type} ${starter.questId || ''} ${starter.npc || ''}`.trim());
+      this.lastActivity = `starter:${starter.type}`;
+      if (this.safety.mode !== 'active') return;
+      return this._doStarter(starter);
+    }
 
     const decision = decideActivity(ctx);
     if (decision.type !== this.lastActivity) this._event(`🎯 ${decision.type} (${decision.reason})`);
@@ -244,19 +340,170 @@ export class Agent {
   }
 
   async _doCombat(ctx) {
+    // Turn-based tactical combat AI not implemented yet; do not auto-engage.
+    if (!this.combatEnabled) return;
     const target = pickTarget(ctx.snap.mobs, ctx.player, { maxLevelDelta: 3 });
-    if (!target) return;
-    this._guardedSend('engageFight', { mid: target.id });
+    if (!target || target.gid == null) return;
+    this._guardedSend('engageFight', { gid: target.gid }); // engage uses gid, not mid
   }
 
-  async _doGather(ctx) {
-    const nodes = freeNodes(this.room.state);
-    if (!nodes.length) return;
-    this._guardedSend('harvest', { cell: nodes[0].cell });
+  // Resource kinds we actually own a tool for (equipped or in inventory).
+  _toolKinds() {
+    const kinds = new Set();
+    const scan = (it) => {
+      const id = String(typeof it === 'string' ? it : it?.id || it?.item || '');
+      for (const [tool, kind] of Object.entries(TOOL_KIND)) if (id.includes(tool)) kinds.add(kind);
+    };
+    this._inventory().forEach(scan);
+    Object.values(this._equipped()).forEach(scan);
+    return kinds;
+  }
+
+  _effectiveKinds() {
+    const owned = this._toolKinds();
+    // Only gather kinds we both want AND have a tool for, minus tool-denied ones.
+    return this.gatherKinds.filter((k) => owned.has(k) && !this._disabledKinds.has(k));
+  }
+
+  async _doGather() {
+    // Wait for the current harvest to resolve before starting another (with a
+    // safety timeout so a lost result never wedges the bot).
+    if (this._busyHarvesting) {
+      if (Date.now() - this._harvestAt > 12000) this._busyHarvesting = false;
+      else return;
+    }
+    if (this.walking || !this.mapData || this.heroCell == null) {
+      return;
+    }
+    const kinds = this._effectiveKinds();
+    if (!kinds.length) return; // no tools for any resource yet
+    // Busy = cells we already started + cooldown nodes + cells that kept denying.
+    const busy = new Set([...this._harvesting, ...this._blockedCells]);
+    for (const n of snapshot(this.room.state).nodes) busy.add(n.cell);
+
+    const target = this.mapData.pickGatherTarget(this.heroCell, {
+      busy,
+      kinds,
+      blockedResources: this._blockedResources,
+    });
+    if (!target) return;
+    this._lastSpot = target.spot;
+
+    // Walk to a cell adjacent to the resource, then harvest it.
+    if (target.path.length) {
+      const arrived = await this._walkTo(target.path);
+      if (!arrived) return;
+    }
+    this._harvesting.add(target.spot.cell);
+    this._busyHarvesting = true;
+    this._harvestAt = Date.now();
+    this._event(`⛏ ${target.spot.type} ${target.spot.resource} @${target.spot.cell}`);
+    this._guardedSend('harvest', { cell: target.spot.cell });
+  }
+
+  // Walk a path by reporting each cell (client-authoritative movement), with a
+  // human-like cadence. Returns true on arrival, false if interrupted/blocked.
+  async _walkTo(path) {
+    this.walking = true;
+    try {
+      let from = this.heroCell;
+      for (const cell of path) {
+        const w = this.safety.canWrite('move');
+        if (!w.ok) return false;
+        const facing = this.mapData.graph.facingTo(from, cell);
+        if (w.dryRun) this.log(`[dry-run] move ${from}→${cell} (facing ${facing})`);
+        else if (!this.room.send('move', { cell, facing })) return false;
+        this.heroCell = cell;
+        from = cell;
+        await sleep(jitter(150, 260)); // walk speed
+        if (!this.running || !this.room?.connected) return false;
+      }
+      return true;
+    } finally {
+      this.walking = false;
+    }
+  }
+
+  // ---------- starter quests (tool acquisition) ----------
+  // Keep live inventory/equipped/gold from any server view payload.
+  _applyView(view) {
+    if (!view) return;
+    if (view.inventory) this._serverInventory = view.inventory;
+    if (view.equipped) this._serverEquipped = view.equipped;
+    if (typeof view.gold === 'number' && this.character?.save?.player) {
+      this.character.save.player.gold = view.gold;
+    }
+  }
+  _inventory() {
+    return this._serverInventory || this.character?.save?.player?.inventory || [];
+  }
+  _equipped() {
+    return this._serverEquipped || this.character?.save?.player?.equipped || {};
+  }
+  _hasTool() {
+    const has = (it) => {
+      const id = typeof it === 'string' ? it : it?.id || it?.item || '';
+      return TOOL_ITEMS.some((t) => String(id).includes(t));
+    };
+    return this._inventory().some(has) || Object.values(this._equipped()).some(has);
+  }
+  _toolInInventory() {
+    for (const it of this._inventory()) {
+      const id = typeof it === 'string' ? it : it?.id || it?.item;
+      if (id && TOOL_ITEMS.some((t) => String(id).includes(t))) return id;
+    }
+    return null;
+  }
+  _questState() {
+    const q = this.questBook || this.character?.save?.player?.quests || {};
+    const active = (q.active || []).map((a) => ({ id: a.id, step: a.step || 0 }));
+    const completed = q.completed || [];
+    return { active, completed, hasTool: this._hasTool() };
+  }
+  _starterAction() {
+    if (!this.mapData) return null;
+    return nextStarterAction(this._questState());
+  }
+
+  async _doStarter(sa) {
+    if (!this._dbgStarter || this._dbgStarter !== sa.type) {
+      this._dbgStarter = sa.type;
+    }
+    if (this.walking) return;
+    // Navigate next to the NPC for accept/turnin steps.
+    if (sa.npc && this.heroCell != null) {
+      const npcCell = this.mapData.npcCell(sa.npc);
+      if (npcCell != null) {
+        const stand = this.mapData.graph.isWalkable(npcCell)
+          ? npcCell
+          : this.mapData.graph.nearestStand(this.heroCell, npcCell);
+        if (stand != null && stand !== this.heroCell) {
+          const path = this.mapData.graph.path(this.heroCell, stand);
+          if (path && path.length) {
+            const arrived = await this._walkTo(path);
+            if (!arrived) return;
+          } else if (path == null) {
+            return; // unreachable
+          }
+        }
+      }
+    }
+    if (sa.type === 'accept') return this._guardedSend('econ_quest_accept', { questId: sa.questId });
+    if (sa.type === 'turnin') return this._guardedSend('econ_quest_turnin', { questId: sa.questId, step: sa.step });
+    if (sa.type === 'equip') return this._equipTool();
+    if (sa.type === 'gather') return this._doGather();
+  }
+
+  _equipTool() {
+    const id = this._toolInInventory();
+    if (!id) return;
+    this._event(`🔧 equipping ${id}`);
+    this._guardedSend('econ_equip', { id });
   }
 
   async _doBank() {
-    this._guardedSend('bank_open', {});
+    const maxFee = (this.feeConfig?.bankFeePerType ?? 1) * 50; // generous cap
+    this._guardedSend('bank_open', { reqId: ++this._seq, maxFee });
   }
 
   async _doAllocate(ctx) {

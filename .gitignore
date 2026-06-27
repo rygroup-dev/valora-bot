@@ -8,3 +8,4 @@ data/*.log
 data/*.lock
 *.log
 .DS_Store
+data/maps/
