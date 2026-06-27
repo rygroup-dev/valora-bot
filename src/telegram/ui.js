@@ -26,7 +26,7 @@ export function mainMenu(labels = []) {
     [btn('⚡ Start farming', 'all', 'go'), btn('👁 Watch only', 'all', 'observe')],
     [btn('🛑 Stop', 'all', 'stop'), btn('▶️ Resume', 'all', 'resume')],
     [btn('🧪 Safe-test mode', 'all', 'dryrun'), btn('📜 Activity log', 'all', 'log')],
-    [btn('🪙 $VALORA', 'all', 'token'), btn('📊 Economy', 'all', 'pulse'), btn('🏆 Top', 'all', 'leaderboard')],
+    [btn('🪙 $VALORA', 'all', 'token'), btn('🌉 Bridge', 'all', 'bridge'), btn('📊 Economy', 'all', 'pulse')],
     [btn('❓ Help / Guide', 'all', 'help'), btn('🔄 Refresh', 'all', 'menu')],
   ];
   for (const l of labels) rows.push(agentRow(l));
@@ -99,6 +99,7 @@ export function helpText() {
     '*Economy & token:*',
     '🪙 *$VALORA* (`/token`) — the game token: your balance + how to get it',
     '   (buy on pump.fun/Jupiter, or earn in-game via the Auction House).',
+    '🌉 *Bridge* (`/bridge`) — gold ↔ $VALORA conversion status.',
     '📊 *Economy* (`/pulse`) — live players & circulating gold.',
     '🏆 *Top* (`/leaderboard [gold|arena]`) — richest / best players.',
     '🛒 *Market* (`/market`) — item index & holders.',

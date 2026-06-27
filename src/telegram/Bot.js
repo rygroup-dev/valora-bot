@@ -31,6 +31,7 @@ export class Bot {
       { command: 'balance', description: '💰 Gold & wallet' },
       { command: 'dryrun', description: '🧪 Toggle dry-run' },
       { command: 'token', description: '🪙 $VALORA info & how to get it' },
+      { command: 'bridge', description: '🌉 Gold ↔ $VALORA bridge status' },
       { command: 'pulse', description: '📊 Live economy' },
       { command: 'leaderboard', description: '🏆 Top players' },
       { command: 'market', description: '🛒 Item index' },
@@ -126,6 +127,10 @@ export class Bot {
       case 'token': {
         const a = agents[0] || [...this.agents.values()][0];
         return this.send(chatId, a ? await a.tokenText() : 'no agent');
+      }
+      case 'bridge': {
+        const a = agents[0] || [...this.agents.values()][0];
+        return this.send(chatId, a ? await a.bridgeText() : 'no agent');
       }
       case 'pulse':
         return this.send(chatId, formatPulse(await this.api.pulse()));

@@ -17,6 +17,11 @@ import { fetchTokenBalance } from './net/balance.js';
 import { VALORA, tokenGuide } from './game/valora.js';
 import { loadMapData } from './game/mapLoader.js';
 import { nextStarterAction } from './game/starter.js';
+import { sellableCart, toolToBuy } from './game/vendor.js';
+
+const BROKER_NPC = 'broker';
+// Estimated broker tool prices (refined from econ_config if provided).
+const TOOL_PRICES = { bucheron_axe: 60, mining_pick: 90, paysan_sickle: 60 };
 
 const TOOL_ITEMS = ['bucheron_axe', 'fishing_rod', 'mining_pick', 'paysan_sickle'];
 // Which resource each tool can harvest.
@@ -300,6 +305,28 @@ export class Agent {
       return this._doStarter(starter);
     }
 
+    // Equip anything we just bought (tool or gear) so it takes effect.
+    if (this._pendingEquip && this._inventory().some((it) => (it.id || it) === this._pendingEquip)) {
+      const id = this._pendingEquip;
+      this._pendingEquip = null;
+      this._disabledKinds.clear(); // a new tool may unlock a previously-blocked kind
+      this.lastActivity = 'equip';
+      if (this.safety.mode !== 'active') return;
+      this._event(`🔧 equipping ${id}`);
+      return this._guardedSend('econ_equip', { id });
+    }
+
+    // Economy: sell when inventory fills up, then buy missing tools / gear upgrades.
+    const econ = this._econAction();
+    if (econ) {
+      if (econ !== this.lastActivity) this._event(`💱 ${econ}`);
+      this.lastActivity = econ;
+      if (this.safety.mode !== 'active') return;
+      if (econ === 'sell') return this._doSell();
+      if (econ === 'buy_tool') return this._doBuyTool();
+      if (econ === 'buy_gear') return this._doBuyGear();
+    }
+
     const decision = decideActivity(ctx);
     if (decision.type !== this.lastActivity) this._event(`🎯 ${decision.type} (${decision.reason})`);
     this.lastActivity = decision.type;
@@ -430,9 +457,20 @@ export class Agent {
     if (!view) return;
     if (view.inventory) this._serverInventory = view.inventory;
     if (view.equipped) this._serverEquipped = view.equipped;
+    if (view.pods) this._pods = view.pods; // {used,max}
     if (typeof view.gold === 'number' && this.character?.save?.player) {
       this.character.save.player.gold = view.gold;
     }
+  }
+
+  _gold() {
+    return this.character?.save?.player?.gold ?? 0;
+  }
+  _podsRatio() {
+    const p = this._pods;
+    if (p && p.max) return p.used / p.max;
+    const max = this.character?.save?.player?.podsMax || 100;
+    return this._inventory().length / max;
   }
   _inventory() {
     return this._serverInventory || this.character?.save?.player?.inventory || [];
@@ -504,6 +542,91 @@ export class Agent {
   async _doBank() {
     const maxFee = (this.feeConfig?.bankFeePerType ?? 1) * 50; // generous cap
     this._guardedSend('bank_open', { reqId: ++this._seq, maxFee });
+  }
+
+  // ---------- economy: sell / buy tools / buy gear ----------
+  _ownedKinds() {
+    return this._toolKinds();
+  }
+
+  // Decide a buy/sell action (string) or null.
+  _econAction() {
+    if (!this.mapData) return null;
+    const sellables = sellableCart(this._inventory(), { tools: TOOL_ITEMS });
+    const podsFull = this._podsRatio() >= 0.85;
+    const manySellables = sellables.reduce((s, c) => s + c.qty, 0) >= 60;
+    if (sellables.length && (podsFull || manySellables)) return 'sell';
+
+    if (toolToBuy({ gold: this._gold(), ownedKinds: this._ownedKinds(), prices: TOOL_PRICES })) {
+      return 'buy_tool';
+    }
+    if (this._gearToBuy()) return 'buy_gear';
+    return null;
+  }
+
+  async _gotoNpc(npcId) {
+    if (this.heroCell == null) return false;
+    const cell = this.mapData.npcCell(npcId);
+    if (cell == null) return false;
+    const stand = this.mapData.graph.isWalkable(cell)
+      ? cell
+      : this.mapData.graph.nearestStand(this.heroCell, cell);
+    if (stand == null) return false;
+    if (stand === this.heroCell) return true;
+    const path = this.mapData.graph.path(this.heroCell, stand);
+    if (!path) return false;
+    return this._walkTo(path);
+  }
+
+  async _doSell() {
+    if (this.walking) return;
+    const cart = sellableCart(this._inventory(), { tools: TOOL_ITEMS });
+    if (!cart.length) return;
+    if (!(await this._gotoNpc(BROKER_NPC))) return;
+    const total = cart.reduce((s, c) => s + c.qty, 0);
+    this._event(`💰 selling ${total} items (${cart.length} types) to broker`, { notify: true });
+    this._guardedSend('econ_sell', { cart });
+  }
+
+  async _doBuyTool() {
+    if (this.walking) return;
+    const tool = toolToBuy({ gold: this._gold(), ownedKinds: this._ownedKinds(), prices: TOOL_PRICES });
+    if (!tool) return;
+    if (!(await this._gotoNpc(BROKER_NPC))) return;
+    this._event(`🛒 buying ${tool.id} (${tool.kind}) for ~${tool.cost}g`, { notify: true });
+    this._guardedSend('econ_buy', { cart: [{ id: tool.id, qty: 1 }] });
+    // it will be equipped next tick via the gear/tool flow
+    this._pendingEquip = tool.id;
+  }
+
+  async _doBuyGear() {
+    if (this.walking) return;
+    const gear = this._gearToBuy();
+    if (!gear) return;
+    if (!(await this._gotoNpc(BROKER_NPC))) return;
+    this._event(`🛡 buying gear ${gear.id} for ~${gear.cost}g`, { notify: true });
+    this._guardedSend('econ_buy', { cart: [{ id: gear.id, qty: 1 }] });
+    this._boughtGear.add(gear.id);
+    this._pendingEquip = gear.id;
+  }
+
+  // Basic broker armor/gear to make the character stronger (bought once each).
+  _gearToBuy() {
+    if (!this._boughtGear) this._boughtGear = new Set();
+    const gold = this._gold();
+    const have = (id) =>
+      this._inventory().some((it) => (it.id || it) === id) ||
+      Object.values(this._equipped()).some((v) => (v?.id || v) === id) ||
+      this._boughtGear.has(id);
+    const GEAR = [
+      { id: 'oak_shield', cost: 120 },
+      { id: 'iron_sword', cost: 150 },
+      { id: 'travel_cape', cost: 100 },
+      { id: 'enchanted_hat', cost: 100 },
+    ];
+    // Keep a gold buffer so we can still buy tools.
+    for (const g of GEAR) if (!have(g.id) && gold >= g.cost + 100) return g;
+    return null;
   }
 
   async _doAllocate(ctx) {
@@ -594,5 +717,31 @@ export class Agent {
   async tokenText() {
     const bal = await this.tokenBalance();
     return tokenGuide(bal);
+  }
+
+  async bridgeText() {
+    const enabled = !!this.econConfig?.goldBridge;
+    const gold = this._gold();
+    const bal = await this.tokenBalance();
+    const lines = [
+      '🌉 *Gold ↔ $VALORA bridge*',
+      `Status: ${enabled ? '🟢 ENABLED' : '🔴 disabled (server-gated)'}`,
+      `🪙 gold: ${gold.toLocaleString()} · ◎ ${bal == null ? '?' : bal.toLocaleString()} $VALORA`,
+      '',
+    ];
+    if (enabled) {
+      lines.push(
+        'The bridge can convert in-game gold into $VALORA on-chain.',
+        '⚠️ This moves real tokens, so it requires your *approval* each time.',
+        'Use the buttons when the bot proposes a bridge, or it stays manual.',
+      );
+    } else {
+      lines.push(
+        'The direct gold→token bridge is currently *disabled* by the game.',
+        'Meanwhile you still earn $VALORA by *selling items on the Auction',
+        'House priced in $VALORA* — buyers pay your wallet directly.',
+      );
+    }
+    return lines.join('\n');
   }
 }
