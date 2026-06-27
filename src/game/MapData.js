@@ -44,11 +44,12 @@ export class MapData {
 
   // Nearest gatherable spot (by path length to a reachable stand) not in `busy`.
   // The stand is the closest walkable cell within the resource's harvest range.
-  pickGatherTarget(from, { busy = new Set(), kinds, blockedResources = new Set() } = {}) {
+  pickGatherTarget(from, { busy = new Set(), kinds, blockedResources = new Set(), wantResource = null } = {}) {
     let best = null;
     let bestLen = Infinity;
     for (const spot of this.spots(kinds)) {
       if (busy.has(spot.cell)) continue;
+      if (wantResource && spot.resource !== wantResource) continue;
       if (blockedResources.has(spot.resource)) continue;
       const radius = MapData.RANGE[spot.type] || 2;
       const stands = this.graph.standsWithin(spot.cell, radius);

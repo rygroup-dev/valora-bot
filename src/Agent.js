@@ -16,7 +16,16 @@ import { humanDelay, sleep, jitter } from './util/timing.js';
 import { fetchTokenBalance } from './net/balance.js';
 import { VALORA, tokenGuide } from './game/valora.js';
 import { loadMapData } from './game/mapLoader.js';
-import { nextStarterAction } from './game/starter.js';
+import { nextQuestAction } from './game/quests.js';
+import RECIPE_MAP from './game/recipes.json' with { type: 'json' };
+
+// Resource -> gather kind (for quest gather steps targeting a specific resource).
+const RESOURCE_KIND = (id) =>
+  id.startsWith('fish_') ? 'fish'
+  : id.startsWith('wood_') ? 'wood'
+  : id.startsWith('ore_') ? 'mineral'
+  : id.startsWith('cereal_') ? 'cereal'
+  : null;
 import { sellableCart, toolToBuy } from './game/vendor.js';
 import { planTurn } from './game/combatAI.js';
 import { chooseHdvListing, hdvTokenUnitPrice } from './game/hdv.js';
@@ -161,6 +170,7 @@ export class Agent {
       .on('econ_config', (m) => (this.econConfig = m))
       .on('econ_result', (m) => {
         this._applyView(m?.view);
+        if (m?.op === 'craft' && m.ok === false) this._event(`craft err: ${m.error}`);
         // Track items we can't equip yet (level-gated) so we stop retrying.
         if (m?.op === 'equip' && m?.error === 'level_req') {
           if (!this._levelBlocked) this._levelBlocked = new Set();
@@ -334,12 +344,13 @@ export class Agent {
 
     // Starter quests come first — they grant the first gathering tool, which
     // unlocks the whole economy. Run until the chain is done & we have a tool.
-    const starter = this._starterAction();
-    if (starter) {
-      if (starter.type !== this.lastActivity) this._event(`🧭 starter: ${starter.type} ${starter.questId || ''} ${starter.npc || ''}`.trim());
-      this.lastActivity = `starter:${starter.type}`;
+    const quest = this._questAction();
+    if (quest) {
+      const label = `quest:${quest.type}`;
+      if (label !== this.lastActivity) this._event(`🧭 ${quest.questId} ${quest.type} ${quest.npc || quest.target || quest.recipe || ''}`.trim());
+      this.lastActivity = label;
       if (this.safety.mode !== 'active') return;
-      return this._doStarter(starter);
+      return this._doQuest(quest);
     }
 
     // Equip anything we just bought (tool or gear) so it takes effect.
@@ -382,7 +393,7 @@ export class Agent {
       case 'combat':
         return this._doCombat(ctx);
       case 'gather':
-        return this._doGather(ctx);
+        return this._doGather();
       case 'rest':
         return this._guardedSend('rest_start', {});
       case 'bank':
@@ -547,7 +558,7 @@ export class Agent {
     return this.gatherKinds.filter((k) => owned.has(k) && !this._disabledKinds.has(k));
   }
 
-  async _doGather() {
+  async _doGather(wantResource = null) {
     // Wait for the current harvest to resolve before starting another (with a
     // safety timeout so a lost result never wedges the bot).
     if (this._busyHarvesting) {
@@ -557,7 +568,8 @@ export class Agent {
     if (this.walking || !this.mapData || this.heroCell == null) {
       return;
     }
-    const kinds = this._effectiveKinds();
+    // For a quest gather step, target that specific resource's kind.
+    const kinds = wantResource ? [RESOURCE_KIND(wantResource)].filter(Boolean) : this._effectiveKinds();
     if (!kinds.length) return; // no tools for any resource yet
     // Busy = cells we already started + cooldown nodes + cells that kept denying.
     const busy = new Set([...this._harvesting, ...this._blockedCells]);
@@ -567,6 +579,7 @@ export class Agent {
       busy,
       kinds,
       blockedResources: this._blockedResources,
+      wantResource,
     });
     if (!target) return;
     this._lastSpot = target.spot;
@@ -689,40 +702,72 @@ export class Agent {
     const q = this.questBook || this.character?.save?.player?.quests || {};
     const active = (q.active || []).map((a) => ({ id: a.id, step: a.step || 0 }));
     const completed = q.completed || [];
-    return { active, completed, hasTool: this._hasTool() };
+    if (!this._blockedQuests) this._blockedQuests = new Set();
+    return { active, completed, hasTool: this._hasTool(), blocked: this._blockedQuests };
   }
-  _starterAction() {
+  _questAction() {
     if (!this.mapData) return null;
-    return nextStarterAction(this._questState());
+    return nextQuestAction(this._questState());
   }
 
-  async _doStarter(sa) {
-    if (!this._dbgStarter || this._dbgStarter !== sa.type) {
-      this._dbgStarter = sa.type;
+  // Block a quest we can't progress (e.g. inspect/reach target unknown) so the
+  // bot moves on to other completable quests instead of getting stuck.
+  _blockQuest(questId, why) {
+    if (!this._blockedQuests) this._blockedQuests = new Set();
+    if (!this._blockedQuests.has(questId)) {
+      this._blockedQuests.add(questId);
+      this._event(`⏭ skipping ${questId} (${why})`);
     }
+  }
+  _stepKey(sa) {
+    return `${sa.questId}:${sa.step}:${sa.type}`;
+  }
+  _bumpStepTries(sa, max = 4) {
+    if (!this._stepTries) this._stepTries = new Map();
+    const k = this._stepKey(sa);
+    const n = (this._stepTries.get(k) || 0) + 1;
+    this._stepTries.set(k, n);
+    return n <= max;
+  }
+
+  async _doQuest(sa) {
     if (this.walking) return;
-    // Navigate next to the NPC for accept/turnin steps.
-    if (sa.npc && this.heroCell != null) {
-      const npcCell = this.mapData.npcCell(sa.npc);
-      if (npcCell != null) {
-        const stand = this.mapData.graph.isWalkable(npcCell)
-          ? npcCell
-          : this.mapData.graph.nearestStand(this.heroCell, npcCell);
-        if (stand != null && stand !== this.heroCell) {
-          const path = this.mapData.graph.path(this.heroCell, stand);
-          if (path && path.length) {
-            const arrived = await this._walkTo(path);
-            if (!arrived) return;
-          } else if (path == null) {
-            return; // unreachable
-          }
+    // Steps that need a specific resource: gather it (targeted).
+    if (sa.type === 'gather') {
+      const want = sa.target && sa.target !== '*' ? sa.target : null;
+      // If this map has no spot for the resource, skip the quest (e.g. cereal
+      // farming / ore that lives on another map — supported in a later phase).
+      if (want) {
+        const kind = RESOURCE_KIND(want);
+        const hasSpot = this.mapData.spots(kind ? [kind] : undefined).some((s) => s.resource === want);
+        if (!hasSpot && !this._bumpStepTries(sa, 2)) {
+          return this._blockQuest(sa.questId, `no ${want} on this map`);
         }
       }
+      return this._doGather(want);
+    }
+    if (sa.type === 'craft') {
+      if (!this._bumpStepTries(sa, 6)) return this._blockQuest(sa.questId, 'craft failed');
+      // The quest target is the OUTPUT item; econ_craft needs the recipe id.
+      const recipeId = RECIPE_MAP[sa.recipe] || sa.recipe;
+      this._event(`🔨 crafting ${sa.count}× ${sa.recipe} (${recipeId})`);
+      return this._guardedSend('econ_craft', { recipeId, times: sa.count || 1 });
+    }
+    // Navigate to the NPC/target for accept/turnin/inspect/reach.
+    const npc = sa.npc || (sa.type === 'turnin' ? sa.npc : null);
+    if (npc != null) {
+      const ok = await this._gotoNpc(npc);
+      if (!ok && !this._bumpStepTries(sa)) return this._blockQuest(sa.questId, 'NPC unreachable');
     }
     if (sa.type === 'accept') return this._guardedSend('econ_quest_accept', { questId: sa.questId });
     if (sa.type === 'turnin') return this._guardedSend('econ_quest_turnin', { questId: sa.questId, step: sa.step });
     if (sa.type === 'equip') return this._equipTool();
-    if (sa.type === 'gather') return this._doGather();
+    // inspect / reach targets aren't in the map data yet — try a turn-in, then
+    // skip the quest if it won't advance so other quests can proceed.
+    if (sa.type === 'inspect' || sa.type === 'reach') {
+      if (!this._bumpStepTries(sa, 3)) return this._blockQuest(sa.questId, `${sa.type} unsupported`);
+      return this._guardedSend('econ_quest_turnin', { questId: sa.questId, step: sa.step });
+    }
   }
 
   _equipTool() {
