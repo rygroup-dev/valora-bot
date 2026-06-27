@@ -18,6 +18,7 @@ import { VALORA, tokenGuide } from './game/valora.js';
 import { loadMapData } from './game/mapLoader.js';
 import { nextQuestAction } from './game/quests.js';
 import RECIPE_MAP from './game/recipes.json' with { type: 'json' };
+import STATION_CELLS from './game/stations.json' with { type: 'json' };
 
 // Resource -> gather kind (for quest gather steps targeting a specific resource).
 const RESOURCE_KIND = (id) =>
@@ -748,10 +749,17 @@ export class Agent {
     }
     if (sa.type === 'craft') {
       if (!this._bumpStepTries(sa, 6)) return this._blockQuest(sa.questId, 'craft failed');
-      // The quest target is the OUTPUT item; econ_craft needs the recipe id.
-      const recipeId = RECIPE_MAP[sa.recipe] || sa.recipe;
-      this._event(`🔨 crafting ${sa.count}× ${sa.recipe} (${recipeId})`);
-      return this._guardedSend('econ_craft', { recipeId, times: sa.count || 1 });
+      // Quest target is the OUTPUT item; econ_craft needs the recipe id + station.
+      const rec = RECIPE_MAP[sa.recipe];
+      if (!rec) return this._blockQuest(sa.questId, `no recipe for ${sa.recipe}`);
+      if ((rec.levelReq || 1) > 1 && !this._craftJobLevelOk(rec)) {
+        return this._blockQuest(sa.questId, `${rec.kind} lvl ${rec.levelReq} needed`);
+      }
+      // Walk to the craft station for this recipe kind.
+      const cells = STATION_CELLS[rec.kind] || [];
+      if (cells.length && !(await this._gotoNear(cells[0], 5))) return;
+      this._event(`🔨 crafting ${sa.count}× ${sa.recipe} @${rec.kind} (${rec.id})`);
+      return this._guardedSend('econ_craft', { recipeId: rec.id, times: sa.count || 1 });
     }
     // Navigate to the NPC/target for accept/turnin/inspect/reach.
     const npc = sa.npc || (sa.type === 'turnin' ? sa.npc : null);
@@ -807,6 +815,27 @@ export class Agent {
     }
     if (this._gearToBuy()) return 'buy_gear';
     return null;
+  }
+
+  // Walk to within `reach` cells of a target cell (for craft stations / POIs).
+  async _gotoNear(targetCell, reach = 5) {
+    if (this.heroCell == null || !this.mapData) return false;
+    const g = this.mapData.graph;
+    const direct = g.path(this.heroCell, targetCell);
+    if (direct && direct.length <= reach) return true; // already close enough
+    for (const s of g.standsWithin(targetCell, reach)) {
+      if (s === this.heroCell) return true;
+      const p = g.path(this.heroCell, s);
+      if (p) return p.length ? this._walkTo(p) : true;
+    }
+    return false;
+  }
+
+  // Whether our craft-job level meets a recipe's requirement.
+  _craftJobLevelOk(rec) {
+    const jobs = this.character?.save?.player?.jobs || {};
+    const lvl = jobs[rec.job]?.level ?? jobs[rec.kind]?.level ?? 1;
+    return lvl >= (rec.levelReq || 1);
   }
 
   async _gotoNpc(npcId) {
