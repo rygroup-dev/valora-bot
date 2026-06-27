@@ -40,6 +40,9 @@ const TOOL_ITEMS = ['bucheron_axe', 'fishing_rod', 'mining_pick', 'paysan_sickle
 const TOOL_KIND = { bucheron_axe: 'wood', fishing_rod: 'fish', mining_pick: 'mineral', paysan_sickle: 'cereal' };
 const KIND_TOOL = { wood: 'bucheron_axe', fish: 'fishing_rod', mineral: 'mining_pick', cereal: 'paysan_sickle' };
 const COMBAT_WEAPON = 'iron_sword';
+// Which map a resource lives on (for cross-map quest gathering).
+const RESOURCE_MAP = (id) => (id.startsWith('ore_') ? 'mine1' : null);
+const HOME_MAP = 'city'; // broker/HDV/most quest givers live here
 // Armor pieces that occupy their own slots (equip once, permanent).
 const ARMOR_ITEMS = ['oak_shield', 'travel_cape', 'enchanted_hat'];
 
@@ -84,6 +87,9 @@ export class Agent {
     // Combat is turn-based tactical; the fight AI is not built yet, so the bot
     // does not auto-engage (avoids getting stuck / dying). Gather-first for now.
     this.combatEnabled = true;
+    // Cross-map travel is implemented (_travelTo) but the server transition
+    // trigger isn't confirmed yet, so it's off until RE'd (avoids wedging).
+    this.crossMapEnabled = false;
   }
 
   // Record an event in the ring buffer; optionally push a Telegram notification.
@@ -733,19 +739,29 @@ export class Agent {
 
   async _doQuest(sa) {
     if (this.walking) return;
-    // Steps that need a specific resource: gather it (targeted).
+    // Steps that need a specific resource: gather it (targeted, cross-map aware).
     if (sa.type === 'gather') {
       const want = sa.target && sa.target !== '*' ? sa.target : null;
-      // If this map has no spot for the resource, skip the quest (e.g. cereal
-      // farming / ore that lives on another map — supported in a later phase).
       if (want) {
         const kind = RESOURCE_KIND(want);
         const hasSpot = this.mapData.spots(kind ? [kind] : undefined).some((s) => s.resource === want);
-        if (!hasSpot && !this._bumpStepTries(sa, 2)) {
-          return this._blockQuest(sa.questId, `no ${want} on this map`);
+        if (!hasSpot) {
+          // Cross-map travel (RESOURCE_MAP / _travelTo) is implemented but the
+          // server-side map-transition trigger isn't confirmed yet, so we skip
+          // off-map quests for now instead of wedging on the wrong map.
+          if (this.crossMapEnabled && RESOURCE_MAP(want) && RESOURCE_MAP(want) !== this.mapId) {
+            if (await this._travelTo(RESOURCE_MAP(want))) return;
+          }
+          if (!this._bumpStepTries(sa, 2)) return this._blockQuest(sa.questId, `no ${want} on this map`);
+          return;
         }
       }
       return this._doGather(want);
+    }
+
+    // City-bound steps: return home first if cross-map travel is enabled.
+    if (this.crossMapEnabled && ['turnin', 'craft', 'inspect', 'accept'].includes(sa.type) && this.mapId !== HOME_MAP) {
+      if (await this._travelTo(HOME_MAP)) return;
     }
     if (sa.type === 'craft') {
       if (!this._bumpStepTries(sa, 6)) return this._blockQuest(sa.questId, 'craft failed');
@@ -815,6 +831,38 @@ export class Agent {
     }
     if (this._gearToBuy()) return 'buy_gear';
     return null;
+  }
+
+  // Cross-map travel: walk to the portal for `mapId`, request the gate, then
+  // load the destination map. heroCell self-corrects from server state, so a
+  // failed transition heals on the next tick / reconnect.
+  async _travelTo(mapId) {
+    if (this.mapId === mapId || !this.mapData) return this.mapId === mapId;
+    const portal = this.mapData.portals().find((p) => p.toMap === mapId);
+    if (!portal) return false;
+    const g = this.mapData.graph;
+    const dest = g.isWalkable(portal.cell) ? portal.cell : g.nearestStand(this.heroCell, portal.cell);
+    if (dest != null && dest !== this.heroCell) {
+      const path = g.path(this.heroCell, dest);
+      if (path && path.length) {
+        const ok = await this._walkTo(path);
+        if (!ok) return false;
+      }
+    }
+    this._event(`🚪 entering ${mapId}…`);
+    this.room.send('gate_check', { map: mapId });
+    this.room.send('move', { cell: portal.cell, facing: 0 }); // step onto the portal
+    await sleep(1800);
+    try {
+      this.mapData = await loadMapData(this.config.base, mapId);
+      this.mapId = mapId;
+      this.heroCell = portal.toCell;
+      this._disabledKinds.clear();
+      this._event(`🗺 now on ${mapId}`, { notify: true });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // Walk to within `reach` cells of a target cell (for craft stations / POIs).
