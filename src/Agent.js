@@ -837,30 +837,23 @@ export class Agent {
   // load the destination map. heroCell self-corrects from server state, so a
   // failed transition heals on the next tick / reconnect.
   async _travelTo(mapId) {
-    if (this.mapId === mapId || !this.mapData) return this.mapId === mapId;
-    const portal = this.mapData.portals().find((p) => p.toMap === mapId);
-    if (!portal) return false;
-    const g = this.mapData.graph;
-    const dest = g.isWalkable(portal.cell) ? portal.cell : g.nearestStand(this.heroCell, portal.cell);
-    if (dest != null && dest !== this.heroCell) {
-      const path = g.path(this.heroCell, dest);
-      if (path && path.length) {
-        const ok = await this._walkTo(path);
-        if (!ok) return false;
-      }
-    }
-    this._event(`🚪 entering ${mapId}…`);
-    this.room.send('gate_check', { map: mapId });
-    this.room.send('move', { cell: portal.cell, facing: 0 }); // step onto the portal
-    await sleep(1800);
+    if (this.mapId === mapId) return true;
+    // Each map is its own Colyseus room — re-join with the new mapId. The server
+    // gates entry by level/hold (gate_check); we verify before switching.
+    this._event(`🚪 traveling to ${mapId}…`);
     try {
-      this.mapData = await loadMapData(this.config.base, mapId);
+      await this.room.switchMap(mapId);
+      this.shardId = this.room.shardId;
       this.mapId = mapId;
-      this.heroCell = portal.toCell;
+      this.mapData = await loadMapData(this.config.base, mapId);
+      // position resolves from server state next tick; seed with spawn.
+      this.heroCell = this.mapData.spawn ?? this.heroCell;
       this._disabledKinds.clear();
+      this._blockedCells.clear();
       this._event(`🗺 now on ${mapId}`, { notify: true });
       return true;
-    } catch {
+    } catch (e) {
+      this._event(`travel failed: ${e?.message}`);
       return false;
     }
   }

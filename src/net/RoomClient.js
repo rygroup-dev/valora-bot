@@ -97,6 +97,22 @@ export class RoomClient {
     }
   }
 
+  // Switch to another map by re-joining the room with a new mapId (each map is
+  // its own Colyseus room). Handlers are re-attached by connect().
+  async switchMap(mapId) {
+    this.mapId = mapId;
+    this._intentionalLeave = true;
+    try {
+      this.room?.leave();
+    } catch {
+      /* ignore */
+    }
+    this.room = null;
+    this._intentionalLeave = false;
+    await this.connect();
+    return this.shardId;
+  }
+
   send(type, payload) {
     if (!this.connected) return false;
     try {
