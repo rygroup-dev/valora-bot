@@ -27,7 +27,7 @@ async function main() {
   const agents = new Map();
 
   // Telegram first so agents can request confirmations during startup.
-  const bot = new Bot({ token: config.telegram.token, owners: config.telegram.owners, agents, log });
+  const bot = new Bot({ token: config.telegram.token, owners: config.telegram.owners, agents, log, base: config.base });
   if (!config.telegram.token) log('telegram disabled (no token) — control via process only');
 
   for (const wallet of walletStore.all()) {

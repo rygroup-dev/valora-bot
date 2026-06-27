@@ -13,6 +13,8 @@ import { decideActivity } from './brain/Brain.js';
 import { bestLoadout, planStatAllocation } from './game/progression.js';
 import { orderShardCandidates } from './util/shards.js';
 import { humanDelay, sleep } from './util/timing.js';
+import { fetchTokenBalance } from './net/balance.js';
+import { VALORA, tokenGuide } from './game/valora.js';
 
 const STAT_BUILD = { vitalite: 0.4, force: 0.4, adresse: 0.2 };
 const GEAR_WEIGHTS = { dmg: 2, pv: 1, force: 1.5, crit: 3, adresse: 1, pa: 5, pm: 4 };
@@ -123,6 +125,10 @@ export class Agent {
       .on('quest_sync', (m) => (this.questSync = m))
       .on('friend_list', noop)
       .on('hdv_listings', (m) => (this.lastListings = m))
+      .on('chat', () => {})
+      .on('chat_denied', () => {})
+      .on('relocate', () => {})
+      .on('quest_result', () => {})
       .on('harvest_result', (m) => {
         this.safety.recordSuccess('harvest');
         if (m?.xp || m?.drops) this._event(`🌿 harvested${m.xp ? ` +${m.xp}xp` : ''}`);
@@ -319,15 +325,27 @@ export class Agent {
     };
   }
 
+  async tokenBalance() {
+    return fetchTokenBalance({ owner: this.wallet.publicKey, mint: VALORA.mint });
+  }
+
   async balanceText() {
     const p = this.character?.save?.player || {};
     const shardInfo = (this._shards || []).find((s) => s.id === this.shardId);
     const tier = shardInfo?.minHold > 0 ? `👑 PRIORITY (hold ≥${shardInfo.minHold.toLocaleString()})` : 'standard';
+    const vbal = await this.tokenBalance();
+    const vstr = vbal == null ? '(rpc unavailable)' : `${vbal.toLocaleString()} $VALORA`;
     return [
       `💰 *${this.label}*`,
       `🪙 gold: ${(p.gold ?? 0).toLocaleString()}`,
-      `🗺 shard: ${shardInfo?.name || this.shardId} · ${tier}`,
+      `◎ wallet: ${vstr}`,
+      `🗺 server: ${shardInfo?.name || this.shardId} · ${tier}`,
       `👛 \`${this.wallet.publicKey}\``,
     ].join('\n');
+  }
+
+  async tokenText() {
+    const bal = await this.tokenBalance();
+    return tokenGuide(bal);
   }
 }

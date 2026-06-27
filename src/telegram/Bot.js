@@ -1,16 +1,18 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { isOwner, parseCommand, ConfirmRegistry } from './control.js';
 import { mainMenu, confirmKeyboard, formatStatus, welcomeText, helpText } from './ui.js';
+import { PublicApi, formatPulse, formatLeaderboard } from '../net/PublicApi.js';
 
 // Owner-only Telegram control surface with inline-keyboard UI.
 // Commands work as slash commands AND as tappable buttons. Commands address
 // agents by label (default: all). Risky actions request inline confirmation.
 export class Bot {
-  constructor({ token, owners, agents, log = console.log }) {
+  constructor({ token, owners, agents, log = console.log, base = 'https://valora.gg/play' }) {
     this.owners = owners;
     this.agents = agents; // Map<label, Agent>
     this.log = log;
     this.confirms = new ConfirmRegistry();
+    this.api = new PublicApi({ base });
     this.tg = token ? new TelegramBot(token, { polling: true }) : null;
     if (this.tg) {
       this._wire();
@@ -28,6 +30,10 @@ export class Bot {
       { command: 'resume', description: '▶️ Resume' },
       { command: 'balance', description: '💰 Gold & wallet' },
       { command: 'dryrun', description: '🧪 Toggle dry-run' },
+      { command: 'token', description: '🪙 $VALORA info & how to get it' },
+      { command: 'pulse', description: '📊 Live economy' },
+      { command: 'leaderboard', description: '🏆 Top players' },
+      { command: 'market', description: '🛒 Item index' },
       { command: 'help', description: 'ℹ️ Help' },
     ]).catch(() => {});
   }
@@ -117,6 +123,21 @@ export class Bot {
         for (const a of agents) this.send(chatId, await a.balanceText());
         if (!agents.length) this.send(chatId, 'no such agent');
         return;
+      case 'token': {
+        const a = agents[0] || [...this.agents.values()][0];
+        return this.send(chatId, a ? await a.tokenText() : 'no agent');
+      }
+      case 'pulse':
+        return this.send(chatId, formatPulse(await this.api.pulse()));
+      case 'leaderboard': {
+        const kind = arg === 'arena' ? 'arena' : 'gold';
+        return this.send(chatId, formatLeaderboard(kind, await this.api.leaderboard(kind, 10)));
+      }
+      case 'market': {
+        const items = await this.api.items();
+        const top = items.slice(0, 15).map((i) => `${i.emoji || '•'} ${i.name} _(${i.rarityLabel || i.rarity})_ — ${i.holders ?? '?'} holders`);
+        return this.send(chatId, `🛒 *Item index* (${items.length})\n${top.join('\n') || '_no data_'}`);
+      }
       default:
         return this.send(chatId, `unknown command: ${cmd}`);
     }
