@@ -18,6 +18,7 @@ import { VALORA, tokenGuide } from './game/valora.js';
 import { loadMapData } from './game/mapLoader.js';
 import { nextStarterAction } from './game/starter.js';
 import { sellableCart, toolToBuy } from './game/vendor.js';
+import { planTurn } from './game/combatAI.js';
 
 const BROKER_NPC = 'broker';
 // Estimated broker tool prices (refined from econ_config if provided).
@@ -26,6 +27,10 @@ const TOOL_PRICES = { bucheron_axe: 60, mining_pick: 90, paysan_sickle: 60 };
 const TOOL_ITEMS = ['bucheron_axe', 'fishing_rod', 'mining_pick', 'paysan_sickle'];
 // Which resource each tool can harvest.
 const TOOL_KIND = { bucheron_axe: 'wood', fishing_rod: 'fish', mining_pick: 'mineral', paysan_sickle: 'cereal' };
+const KIND_TOOL = { wood: 'bucheron_axe', fish: 'fishing_rod', mineral: 'mining_pick', cereal: 'paysan_sickle' };
+const COMBAT_WEAPON = 'iron_sword';
+// Armor pieces that occupy their own slots (equip once, permanent).
+const ARMOR_ITEMS = ['oak_shield', 'travel_cape', 'enchanted_hat'];
 
 const STAT_BUILD = { vitalite: 0.4, force: 0.4, adresse: 0.2 };
 const GEAR_WEIGHTS = { dmg: 2, pv: 1, force: 1.5, crit: 3, adresse: 1, pa: 5, pm: 4 };
@@ -67,7 +72,7 @@ export class Agent {
     this._lastSpot = null;
     // Combat is turn-based tactical; the fight AI is not built yet, so the bot
     // does not auto-engage (avoids getting stuck / dying). Gather-first for now.
-    this.combatEnabled = false;
+    this.combatEnabled = true;
   }
 
   // Record an event in the ring buffer; optionally push a Telegram notification.
@@ -155,6 +160,15 @@ export class Agent {
       .on('econ_config', (m) => (this.econConfig = m))
       .on('econ_result', (m) => {
         this._applyView(m?.view);
+        // Track items we can't equip yet (level-gated) so we stop retrying.
+        if (m?.op === 'equip' && m?.error === 'level_req') {
+          if (!this._levelBlocked) this._levelBlocked = new Set();
+          // the last item we attempted to equip
+          if (this._lastEquipId) {
+            this._levelBlocked.add(this._lastEquipId);
+            if (this._lastEquipId === COMBAT_WEAPON) this._swordBlocked = true;
+          }
+        }
       })
       .on('hdv_config', (m) => (this.hdvConfig = m))
       .on('fee_config', (m) => (this.feeConfig = m))
@@ -176,7 +190,6 @@ export class Agent {
       .on('hdv_listings', (m) => (this.lastListings = m))
       .on('chat', () => {})
       .on('chat_denied', () => {})
-      .on('relocate', () => {})
       .on('harvest_started', (m) => {
         // Server accepted the harvest; finish after the node's duration to collect.
         const cell = m?.cell;
@@ -224,10 +237,19 @@ export class Agent {
         }
       })
       .on('fightResult', (m) => {
-        const won = m?.win ?? m?.won ?? m?.victory;
-        this._event(won ? `⚔️ fight won${m?.xp ? ` +${m.xp}xp` : ''}` : '💀 fight lost', { notify: true });
+        this.inFight = false;
+        this.fightState = null;
+        this._placed = false;
+        const won = m?.win ?? m?.won ?? m?.victory ?? m?.outcome === 'win';
+        if (won) this._fightsWon = (this._fightsWon || 0) + 1;
+        this._applyView(m?.view);
+        this._event(won ? `⚔️ fight won${m?.xp ? ` +${m.xp}xp` : ''} [#${this._fightsWon || 0}]` : '💀 fight lost', { notify: true });
       })
       .on('fight_denied', () => this.safety.recordDenied('engageFight'))
+      .on('fight', (m) => this._onFight(m))
+      .on('relocate', (m) => {
+        if (typeof m?.cell === 'number') this.heroCell = m.cell;
+      })
       .on('admin_notice', (m) => this._event(`📢 ${typeof m === 'string' ? m : JSON.stringify(m)}`, { notify: true }));
   }
 
@@ -269,7 +291,13 @@ export class Agent {
       quests: { actionable: (p.quests?.active || []).length > 0 },
       arena: { available: false },
       profit: {
-        combatValue: this.combatEnabled && snap.mobs?.length ? 50 : 0,
+        // Only value combat when a winnable, full-HP fight is actually available.
+        combatValue:
+          this.combatEnabled &&
+          (self.hp ?? p.hp ?? 50) / (p.maxHp || 50) >= 0.8 &&
+          pickTarget(snap.mobs || [], { level: p.level ?? 1, cell: this.heroCell }, { maxLevelDelta: this.combatDelta ?? 2, prefer: 'weakest' })
+            ? 55
+            : 0,
         gatherValue: canGather ? 30 : 0,
         bestCraftProfit: 0,
       },
@@ -316,6 +344,12 @@ export class Agent {
       return this._guardedSend('econ_equip', { id });
     }
 
+    // Equip any owned armor that isn't worn yet (makes the character stronger).
+    if (this.safety.mode === 'active' && this._equipArmorOnce()) {
+      this.lastActivity = 'equip_armor';
+      return;
+    }
+
     // Economy: sell when inventory fills up, then buy missing tools / gear upgrades.
     const econ = this._econAction();
     if (econ) {
@@ -354,6 +388,7 @@ export class Agent {
 
   // ---------- executors (safety-gated) ----------
   _guardedSend(action, payload, { confirmed = false } = {}) {
+    if (action === 'econ_equip' && payload?.id) this._lastEquipId = payload.id;
     const ok = this.safety.canWrite(action, { confirmed });
     if (!ok.ok) {
       this.log(`blocked ${action}: ${ok.reason}`);
@@ -367,11 +402,121 @@ export class Agent {
   }
 
   async _doCombat(ctx) {
-    // Turn-based tactical combat AI not implemented yet; do not auto-engage.
-    if (!this.combatEnabled) return;
-    const target = pickTarget(ctx.snap.mobs, ctx.player, { maxLevelDelta: 3 });
+    if (!this.combatEnabled || this.inFight || this.walking) return;
+    // Only fight at (near) full HP — never walk into a fight already hurt.
+    if (ctx.player.maxHp && ctx.player.hp / ctx.player.maxHp < 0.8) return;
+    const mobs = ctx.snap.mobs || [];
+    // Only engage winnable fights: mobs at most `combatDelta` above our level.
+    const target = pickTarget(mobs, { ...ctx.player, cell: this.heroCell }, {
+      maxLevelDelta: this.combatDelta ?? 2,
+      prefer: 'weakest',
+    });
     if (!target || target.gid == null) return;
+
+    // Navigate next to the mob before engaging (engage is range-limited).
+    if (this.heroCell != null && this.mapData) {
+      const d = this.mapData.graph.path(this.heroCell, target.cell);
+      if (d && d.length > 1) {
+        const stand = this.mapData.graph.standsWithin(target.cell, 2)[0];
+        if (stand && stand !== this.heroCell) {
+          const path = this.mapData.graph.path(this.heroCell, stand);
+          if (path && path.length) {
+            const arrived = await this._walkTo(path);
+            if (!arrived) return;
+          }
+        }
+      }
+    }
+    // Prefer a real weapon if we can equip it, but never block the fight on it
+    // (broker gear is level-gated; a gathering tool still does base damage).
+    if (this._weaponEquipped() !== COMBAT_WEAPON && this._invHas(COMBAT_WEAPON) && !this._swordBlocked) {
+      this._guardedSend('econ_equip', { id: COMBAT_WEAPON });
+    }
+    this._event(`⚔️ engaging ${target.mobId} (lvl ${target.level})`);
+    this.inFight = true;
+    this._placed = false;
+    this._engagedMid = target.id;
     this._guardedSend('engageFight', { gid: target.gid }); // engage uses gid, not mid
+  }
+
+  // Event-driven combat: react to each `fight` state update from the server.
+  _onFight(state) {
+    if (!state) return;
+    this.inFight = true;
+    this.fightState = state;
+    if (this.safety.mode !== 'active') return;
+    try {
+      this._playFight(state);
+    } catch (e) {
+      this.log(`fight error: ${e?.message}`);
+      this.room.send('fightAct', { kind: 'endTurn' });
+    }
+  }
+
+  _mySessionId() {
+    return this.room?.room?.sessionId;
+  }
+
+  // Map the live fight state to the combat planner shape and act.
+  _playFight(raw) {
+    const state = raw.snapshot || raw; // server wraps the state in `snapshot`
+    const phase = state.phase;
+    const fighters = state.fighters || [];
+    const me = fighters.find((f) => f.kind === 'player' && f.team === 0)
+      || fighters.find((f) => f.name === this.character?.save?.player?.name)
+      || fighters.find((f) => f.team === 0);
+    if (!me) return;
+
+    // Placement phase: take a start cell then ready up (once).
+    if (phase === 'placement' || phase === 'place') {
+      if (this._placed) return;
+      this._placed = true;
+      const cells = state.startCells?.[0] || state.startCells?.team0 || [];
+      const cell = (Array.isArray(cells) ? cells[0] : null) ?? me.cell ?? this.heroCell;
+      if (cell != null) this.room.send('fightAct', { kind: 'placement', cell });
+      setTimeout(() => this.inFight && this.room.send('fightAct', { kind: 'ready' }), jitter(400, 800));
+      return;
+    }
+
+    // Combat phase: only act on our turn.
+    if (state.winner != null) return;
+    const order = state.order || [];
+    const ptr = state.turnPtr ?? 0;
+    const activeId = order[ptr];
+    if (activeId !== me.id) return; // not our turn
+
+    const myCell = me.cell ?? this.heroCell;
+    const ap = me.curAp ?? me.ap ?? 6;
+    const mp = me.curMp ?? me.mp ?? 3;
+    const hp = me.hp ?? 50;
+    const maxHp = me.maxHp ?? hp;
+    const enemies = fighters
+      .filter((f) => f.team !== me.team && (f.alive ?? true) && (f.hp ?? 1) > 0)
+      .map((f) => ({ id: f.id, cell: f.cell, hp: f.hp ?? 1 }));
+
+    const grid = this.mapData?.graph;
+    const dist = (a, b) =>
+      grid ? (grid.path(a, b)?.length ?? Math.abs(a - b)) : Math.abs(a - b);
+    const stepToward = (from, target, mpLeft) => {
+      if (!grid) return from;
+      const path = grid.path(from, target);
+      if (!path || !path.length) return from;
+      return path[Math.min(path.length - 1, mpLeft) - 1] ?? from;
+    };
+
+    if (this._actingTurn === state.turn) return; // already acting this turn
+    this._actingTurn = state.turn;
+    const acts = planTurn({ self: { cell: myCell, ap, mp, hp, maxHp }, enemies, dist, stepToward });
+    const summary = acts.map((a) => (a.spellId ? a.spellId : a.kind)).join('>');
+    this._event(`🗡 turn ${state.turn} (hp ${hp}/${maxHp}, ${enemies.length} foe): ${summary}`);
+    this._sendActs(acts, 0);
+  }
+
+  // Send fight acts sequentially with a small human delay between them.
+  _sendActs(acts, i) {
+    if (!this.inFight || i >= acts.length) return;
+    this.room.send('fightAct', acts[i]);
+    setTimeout(() => this._sendActs(acts, i + 1), jitter(500, 1000));
   }
 
   // Resource kinds we actually own a tool for (equipped or in inventory).
@@ -415,6 +560,9 @@ export class Agent {
     });
     if (!target) return;
     this._lastSpot = target.spot;
+
+    // Equip the matching tool (weapon slot is shared with combat/other tools).
+    if (!this._ensureWeapon(KIND_TOOL[target.spot.type])) return;
 
     // Walk to a cell adjacent to the resource, then harvest it.
     if (target.path.length) {
@@ -491,6 +639,41 @@ export class Agent {
       if (id && TOOL_ITEMS.some((t) => String(id).includes(t))) return id;
     }
     return null;
+  }
+  _invHas(id) {
+    return this._inventory().some((it) => (typeof it === 'string' ? it : it?.id || it?.item) === id);
+  }
+  _equippedId(slot) {
+    const v = this._equipped()[slot];
+    return v == null ? null : typeof v === 'string' ? v : v.id || v.item;
+  }
+  _weaponEquipped() {
+    return this._equippedId('weapon');
+  }
+  // Ensure `id` is the equipped weapon. Returns true if already; else equips and
+  // returns false (act resumes next tick once the server confirms).
+  _ensureWeapon(id) {
+    if (!id) return true;
+    if (this._weaponEquipped() === id) return true;
+    if (!this._invHas(id)) return true; // not owned — proceed with whatever we have
+    this._guardedSend('econ_equip', { id });
+    return false;
+  }
+  // Equip one not-yet-equipped armor piece (distinct slots). Returns true if it acted.
+  _equipArmorOnce() {
+    if (!this._armorTried) this._armorTried = new Map();
+    const equippedIds = new Set(Object.values(this._equipped()).map((v) => (typeof v === 'string' ? v : v?.id)));
+    const blocked = this._levelBlocked || new Set();
+    for (const a of ARMOR_ITEMS) {
+      if (blocked.has(a)) continue; // level-gated, can't equip yet
+      if (this._invHas(a) && !equippedIds.has(a) && (this._armorTried.get(a) || 0) < 2) {
+        this._armorTried.set(a, (this._armorTried.get(a) || 0) + 1);
+        this._event(`🛡 equipping ${a}`);
+        this._guardedSend('econ_equip', { id: a });
+        return true;
+      }
+    }
+    return false;
   }
   _questState() {
     const q = this.questBook || this.character?.save?.player?.quests || {};
@@ -613,6 +796,9 @@ export class Agent {
   // Basic broker armor/gear to make the character stronger (bought once each).
   _gearToBuy() {
     if (!this._boughtGear) this._boughtGear = new Set();
+    // Most broker gear is level-gated; don't waste gold until the character has
+    // leveled up via combat enough to equip it.
+    if ((this.character?.save?.player?.level || 1) < 3) return null;
     const gold = this._gold();
     const have = (id) =>
       this._inventory().some((it) => (it.id || it) === id) ||
