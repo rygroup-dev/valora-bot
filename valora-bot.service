@@ -1,0 +1,18 @@
+[Unit]
+Description=Valora Bot (valora.gg automation)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/valora-bot
+ExecStart=/usr/bin/node src/index.js
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+# Reads /root/valora-bot/.env via dotenv
+StandardOutput=append:/root/valora-bot/data/bot.log
+StandardError=append:/root/valora-bot/data/bot.log
+
+[Install]
+WantedBy=multi-user.target

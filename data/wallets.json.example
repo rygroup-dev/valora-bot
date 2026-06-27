@@ -1,0 +1,4 @@
+[
+  { "label": "main", "key": "BASE58_SECRET_KEY_OR_[json,byte,array]" },
+  { "label": "sub1", "key": "ANOTHER_WALLET_SECRET" }
+]

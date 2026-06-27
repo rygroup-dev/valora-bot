@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+!.env.example
+data/*.json
+!data/wallets.json.example
+data/*.log
+data/*.lock
+*.log
+.DS_Store
