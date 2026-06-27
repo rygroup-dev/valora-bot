@@ -19,6 +19,7 @@ import { loadMapData } from './game/mapLoader.js';
 import { nextStarterAction } from './game/starter.js';
 import { sellableCart, toolToBuy } from './game/vendor.js';
 import { planTurn } from './game/combatAI.js';
+import { chooseHdvListing, hdvTokenUnitPrice } from './game/hdv.js';
 
 const BROKER_NPC = 'broker';
 // Estimated broker tool prices (refined from econ_config if provided).
@@ -171,6 +172,15 @@ export class Agent {
         }
       })
       .on('hdv_config', (m) => (this.hdvConfig = m))
+      .on('hdv_listings', (m) => this._onHdvListings(m))
+      .on('hdv_result', (m) => {
+        if (m?.op === 'list') {
+          this._hdvBusy = false;
+          if (m.ok) this._event(`🏷 listed on HDV for $VALORA`, { notify: true });
+          else this._event(`hdv list: ${m.error}`);
+        }
+      })
+      .on('hdv_sold', (m) => this._event(`💸 HDV sale: ${m?.itemId || ''} for ${m?.currency === 'token' ? '$VALORA' : 'gold'}`, { notify: true }))
       .on('fee_config', (m) => (this.feeConfig = m))
       .on('stat_reset_config', (m) => (this.statResetConfig = m))
       .on('creature_config', noop)
@@ -187,7 +197,6 @@ export class Agent {
         if (m?.ok) this._event(`📜 quest progress${m.questId ? ` (${m.questId})` : ''}`);
       })
       .on('friend_list', noop)
-      .on('hdv_listings', (m) => (this.lastListings = m))
       .on('chat', () => {})
       .on('chat_denied', () => {})
       .on('harvest_started', (m) => {
@@ -356,6 +365,7 @@ export class Agent {
       if (econ !== this.lastActivity) this._event(`💱 ${econ}`);
       this.lastActivity = econ;
       if (this.safety.mode !== 'active') return;
+      if (econ === 'hdv_list') return this._doHdvList();
       if (econ === 'sell') return this._doSell();
       if (econ === 'buy_tool') return this._doBuyTool();
       if (econ === 'buy_gear') return this._doBuyGear();
@@ -738,6 +748,13 @@ export class Agent {
     const sellables = sellableCart(this._inventory(), { tools: TOOL_ITEMS });
     const podsFull = this._podsRatio() >= 0.85;
     const manySellables = sellables.reduce((s, c) => s + c.qty, 0) >= 60;
+
+    // Periodically list a stack on the Auction House for $VALORA (token income).
+    const hdvReady = Date.now() - (this._lastHdvAt || 0) > 120000;
+    if (!this._hdvBusy && hdvReady && this.hdvConfig?.tokenItems && chooseHdvListing(this._inventory(), { tools: TOOL_ITEMS })) {
+      return 'hdv_list';
+    }
+
     if (sellables.length && (podsFull || manySellables)) return 'sell';
 
     if (toolToBuy({ gold: this._gold(), ownedKinds: this._ownedKinds(), prices: TOOL_PRICES })) {
@@ -759,6 +776,42 @@ export class Agent {
     const path = this.mapData.graph.path(this.heroCell, stand);
     if (!path) return false;
     return this._walkTo(path);
+  }
+
+  // List a stack on the Auction House priced in $VALORA. Two-step: browse the
+  // item for current token prices, then list (handled in _onHdvListings).
+  async _doHdvList() {
+    if (this._hdvBusy) return;
+    const pick = chooseHdvListing(this._inventory(), { tools: TOOL_ITEMS });
+    if (!pick) return;
+    this._hdvBusy = true;
+    this._lastHdvAt = Date.now();
+    this._hdvIntent = pick;
+    this._event(`🏷 pricing ${pick.qty}× ${pick.itemId} for HDV ($VALORA)…`);
+    this._guardedSend('hdv_browse', { itemId: pick.itemId, reqId: ++this._seq });
+    // Safety: if no listings come back, clear the busy flag.
+    setTimeout(() => {
+      this._hdvBusy = false;
+    }, 8000);
+  }
+
+  _onHdvListings(m) {
+    const intent = this._hdvIntent;
+    if (!intent || m?.scope !== 'browse') return;
+    const listings = m.listings || [];
+    if (listings.length && listings[0].itemId !== intent.itemId) return;
+    const tokenListings = listings.filter((l) => l.currency === 'token' && !l.mine);
+    const decimals = this.hdvConfig?.decimals ?? 6;
+    const unitPrice = hdvTokenUnitPrice({ tokenListings, floorToken: 0.01, decimals });
+    this._hdvIntent = null;
+    this._event(`🏷 listing ${intent.qty}× ${intent.itemId} @ ${(unitPrice / 10 ** decimals).toFixed(4)} $VALORA`, { notify: true });
+    this._guardedSend('hdv_list', {
+      itemId: intent.itemId,
+      qty: intent.qty,
+      unitPrice,
+      currency: 'token',
+      reqId: ++this._seq,
+    });
   }
 
   async _doSell() {
@@ -906,20 +959,23 @@ export class Agent {
   }
 
   async bridgeText() {
-    const enabled = !!this.econConfig?.goldBridge;
+    const enabled = !!(this.hdvConfig?.goldBridge ?? this.econConfig?.goldBridge);
+    const usd = this.hdvConfig?.tokenUsd;
     const gold = this._gold();
     const bal = await this.tokenBalance();
     const lines = [
       '🌉 *Gold ↔ $VALORA bridge*',
       `Status: ${enabled ? '🟢 ENABLED' : '🔴 disabled (server-gated)'}`,
       `🪙 gold: ${gold.toLocaleString()} · ◎ ${bal == null ? '?' : bal.toLocaleString()} $VALORA`,
+      usd ? `💵 $VALORA ≈ $${usd}` : '',
       '',
     ];
     if (enabled) {
       lines.push(
-        'The bridge can convert in-game gold into $VALORA on-chain.',
-        '⚠️ This moves real tokens, so it requires your *approval* each time.',
-        'Use the buttons when the bot proposes a bridge, or it stays manual.',
+        '🟢 Token economy is ON. The bot earns $VALORA by *listing your items on',
+        'the Auction House priced in $VALORA* — buyers pay your wallet directly.',
+        'It lists a stack every couple of minutes (see /log).',
+        '⚠️ Buying with token (spending $VALORA) always asks for your approval.',
       );
     } else {
       lines.push(
