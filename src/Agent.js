@@ -29,7 +29,10 @@ const RESOURCE_KIND = (id) =>
   : null;
 import { sellableCart, toolToBuy } from './game/vendor.js';
 import { planTurn } from './game/combatAI.js';
-import { chooseHdvListing, hdvTokenUnitPrice } from './game/hdv.js';
+import { chooseHdvListing, hdvTokenUnitPrice, marketFloorToken } from './game/hdv.js';
+import { questReservations } from './game/reserve.js';
+import { QUEST_CATALOG } from './game/quests.js';
+import { gatePasses } from './game/gate.js';
 
 const BROKER_NPC = 'broker';
 // Estimated broker tool prices (refined from econ_config if provided).
@@ -87,9 +90,10 @@ export class Agent {
     // Combat is turn-based tactical; the fight AI is not built yet, so the bot
     // does not auto-engage (avoids getting stuck / dying). Gather-first for now.
     this.combatEnabled = true;
-    // Cross-map travel is implemented (_travelTo) but the server transition
-    // trigger isn't confirmed yet, so it's off until RE'd (avoids wedging).
-    this.crossMapEnabled = false;
+    // Cross-map travel: gate_check → walk to portal → await-leave + re-join the
+    // destination room (the anti-teleport-safe flow the live client uses). Live-
+    // verified round-trip city↔mine1 with ore gathering, so it's enabled.
+    this.crossMapEnabled = true;
   }
 
   // Record an event in the ring buffer; optionally push a Telegram notification.
@@ -143,10 +147,16 @@ export class Agent {
       base: this.config.base,
       token: this.rest.token,
       mapId: this.character.save?.pos?.mapId || 'city',
+      homeMapId: HOME_MAP,
       shardCandidates: candidates,
       log: this.log,
       onLeave: (code) => this._event(`🔌 disconnected (code ${code}) — reconnecting…`, { notify: true }),
-      onRejoin: (shard) => this._event(`🔁 reconnected to ${shard}`, { notify: true }),
+      onRejoin: (shard) => {
+        // After an app-close fallback the room may now be on the home map.
+        this._syncMapAfterReconnect();
+        this._event(`🔁 reconnected to ${shard}`, { notify: true });
+      },
+      onAny: (type, msg) => this._onAnyMessage(type, msg),
     });
     this._wireRoom();
     await this.room.connect();
@@ -348,6 +358,18 @@ export class Agent {
     }
     this._lastLevel = lvl;
     this._lastGold = gold;
+
+    // Critical safety: if the bag is (nearly) full, sell BEFORE anything else so
+    // we can never wedge unable to gather — even mid-quest. _doSell returns home
+    // for the broker if we're off on another map.
+    if (this.safety.mode === 'active' && this._podsRatio() >= 0.9) {
+      const cart = sellableCart(this._inventory(), { tools: TOOL_ITEMS, keep: this._reserved() });
+      if (cart.length) {
+        if (this.lastActivity !== 'sell_full') this._event('🎒 bag full — selling before continuing');
+        this.lastActivity = 'sell_full';
+        return this._doSell();
+      }
+    }
 
     // Starter quests come first — they grant the first gathering tool, which
     // unlocks the whole economy. Run until the chain is done & we have a tool.
@@ -811,16 +833,28 @@ export class Agent {
     return this._toolKinds();
   }
 
+  // Items we must NOT sell because an active/upcoming quest still needs them.
+  _reserved() {
+    const qs = this._questState();
+    return questReservations(QUEST_CATALOG, {
+      active: qs.active,
+      completed: qs.completed,
+      blocked: qs.blocked,
+    });
+  }
+
   // Decide a buy/sell action (string) or null.
   _econAction() {
     if (!this.mapData) return null;
-    const sellables = sellableCart(this._inventory(), { tools: TOOL_ITEMS });
+    const reserve = this._reserved();
+    const sellables = sellableCart(this._inventory(), { tools: TOOL_ITEMS, keep: reserve });
     const podsFull = this._podsRatio() >= 0.85;
     const manySellables = sellables.reduce((s, c) => s + c.qty, 0) >= 60;
 
     // Periodically list a stack on the Auction House for $VALORA (token income).
+    // $VALORA goes to the user's real wallet, so HDV is the profit-priority path.
     const hdvReady = Date.now() - (this._lastHdvAt || 0) > 120000;
-    if (!this._hdvBusy && hdvReady && this.hdvConfig?.tokenItems && chooseHdvListing(this._inventory(), { tools: TOOL_ITEMS })) {
+    if (!this._hdvBusy && hdvReady && this.hdvConfig?.tokenItems && chooseHdvListing(this._inventory(), { tools: TOOL_ITEMS, reserve })) {
       return 'hdv_list';
     }
 
@@ -833,29 +867,124 @@ export class Agent {
     return null;
   }
 
-  // Cross-map travel: walk to the portal for `mapId`, request the gate, then
-  // load the destination map. heroCell self-corrects from server state, so a
-  // failed transition heals on the next tick / reconnect.
+  // Telemetry: observe every server message. Most are handled by named handlers;
+  // this catches UNKNOWN types so we can discover the portal/map-transition
+  // protocol, and auto-follows an explicit server-driven map change if one comes.
+  _onAnyMessage(type, msg) {
+    const KNOWN = this._knownMsgTypes || (this._knownMsgTypes = new Set([
+      'econ_config', 'econ_result', 'hdv_config', 'hdv_listings', 'hdv_result', 'hdv_sold',
+      'fee_config', 'stat_reset_config', 'creature_config', 'time_config', 'spectate_config',
+      'quest_sync', 'quest_result', 'friend_list', 'chat', 'chat_denied',
+      'harvest_started', 'harvest_result', 'harvest_denied', 'fightResult', 'fight_denied',
+      'fight', 'relocate', 'admin_notice',
+    ]));
+    if (KNOWN.has(type)) return;
+    // Log unknown messages (trimmed) while we're investigating, especially when
+    // we're mid-travel — this is how the transition protocol reveals itself.
+    if (this._awaitingTransition || this._travelDiag) {
+      const body = (() => { try { return JSON.stringify(msg).slice(0, 160); } catch { return String(msg); } })();
+      this._event(`📡 srv msg '${type}': ${body}`);
+    }
+    // Auto-follow an explicit map-change directive (covers several likely names).
+    if (/^(mapchange|changemap|map_change|travel|portal|warp|enter_map|zone_change)$/i.test(type)) {
+      const dest = msg?.mapId || msg?.toMap || msg?.map || msg?.to;
+      const cell = msg?.cell ?? msg?.toCell;
+      if (dest) this._serverDrivenTravel = { mapId: dest, cell };
+    }
+  }
+
+  // Keep our map/data in sync if a reconnect (or app-close fallback) landed us
+  // on a different map than we think we're on.
+  async _syncMapAfterReconnect() {
+    const rcMap = this.room?.mapId;
+    if (rcMap && rcMap !== this.mapId) {
+      this.mapId = rcMap;
+      try {
+        this.mapData = await loadMapData(this.config.base, rcMap);
+        this.heroCell = this.mapData.spawn ?? this.heroCell;
+        this._disabledKinds.clear();
+        this._blockedCells.clear();
+        this._event(`🗺 synced to ${rcMap} after reconnect`);
+      } catch (e) {
+        this.log(`map sync failed: ${e?.message}`);
+      }
+    }
+  }
+
+  // Cross-map travel — the legitimate (anti-teleport-safe) way:
+  //   1. walk onto the portal cell on the CURRENT map (so the server records a
+  //      real arrival, not a teleport),
+  //   2. give the server a moment to drive the transition itself,
+  //   3. if it doesn't, re-join the destination room (now legitimized by our
+  //      server-side position on the portal),
+  //   4. verify the new room is stable; on rejection (4001) fall back home and
+  //      cool down so we never loop. heroCell self-corrects from server state.
   async _travelTo(mapId) {
     if (this.mapId === mapId) return true;
-    // Each map is its own Colyseus room — re-join with the new mapId. The server
-    // gates entry by level/hold (gate_check); we verify before switching.
-    this._event(`🚪 traveling to ${mapId}…`);
+    if (this._travelCooldown && Date.now() < this._travelCooldown) return false;
+    if (this.walking || this.inFight) return false;
+    const portal = this.mapData?.portalTo(mapId);
+    if (!portal) {
+      this._event(`no portal to ${mapId} on ${this.mapId}`);
+      return false;
+    }
+
+    // 1. Zone gate: ask the server if we're allowed in (level / token hold),
+    //    exactly like the live client's tryEnterPortal → requestGate.
+    const level = this.character?.save?.player?.level ?? 1;
+    const gate = await this.room.requestGate(mapId);
+    if (!gatePasses(gate, level)) {
+      const need = gate?.failHold
+        ? `hold ${gate.minHold?.toLocaleString?.() || gate.minHold} $VALORA`
+        : `level ${gate?.minLevel} (you are ${level})`;
+      this._travelCooldown = Date.now() + 5 * 60 * 1000; // don't re-knock constantly
+      this._event(`🚧 ${mapId} gated — need ${need}; skipping`, { notify: true });
+      return false;
+    }
+
+    // 2. Walk onto the portal cell (human-like; the actual transition is the
+    //    leave+rejoin below, which the awaited leave makes anti-teleport-safe).
+    if (this.heroCell !== portal.cell) {
+      const path = this.mapData.graph.path(this.heroCell, portal.cell);
+      if (!path) { this._event(`portal cell ${portal.cell} unreachable`); return false; }
+      this._event(`🚪 heading to portal → ${mapId} (cell ${portal.cell})`);
+      if (path.length && !(await this._walkTo(path))) return false;
+      this.heroCell = portal.cell;
+    }
+
+    // 3. changeMap: AWAIT-leave the current room, then join the destination.
+    this._event(`🚪 entering ${mapId}…`);
     try {
       await this.room.switchMap(mapId);
       this.shardId = this.room.shardId;
+      // 4. Verify the room stays up (a rejection closes within ~1s).
+      await sleep(2500);
+      if (!this.room?.connected || this.room.lastCloseCode >= 4000) {
+        throw new Error(`rejected (code ${this.room?.lastCloseCode ?? 'closed'})`);
+      }
       this.mapId = mapId;
       this.mapData = await loadMapData(this.config.base, mapId);
-      // position resolves from server state next tick; seed with spawn.
-      this.heroCell = this.mapData.spawn ?? this.heroCell;
+      this.heroCell = portal.toCell ?? this.mapData.spawn ?? this.heroCell;
       this._disabledKinds.clear();
       this._blockedCells.clear();
-      this._event(`🗺 now on ${mapId}`, { notify: true });
+      this._event(`🗺 arrived on ${mapId} (cell ${this.heroCell})`, { notify: true });
       return true;
     } catch (e) {
-      this._event(`travel failed: ${e?.message}`);
+      // Cool down (5 min) and let the RoomClient's home-fallback heal us.
+      this._travelCooldown = Date.now() + 5 * 60 * 1000;
+      this._event(`travel to ${mapId} failed: ${e?.message} — staying put, cooling down`, { notify: true });
+      await this._syncMapAfterReconnect();
       return false;
     }
+  }
+
+  // Public: triggered from Telegram (/travel <map>) for controlled testing.
+  async travelTo(mapId) {
+    this._travelDiag = true;
+    this._travelCooldown = 0; // manual override
+    const ok = await this._travelTo(mapId);
+    this._travelDiag = false;
+    return ok;
   }
 
   // Walk to within `reach` cells of a target cell (for craft stations / POIs).
@@ -897,8 +1026,9 @@ export class Agent {
   // item for current token prices, then list (handled in _onHdvListings).
   async _doHdvList() {
     if (this._hdvBusy) return;
-    const pick = chooseHdvListing(this._inventory(), { tools: TOOL_ITEMS });
+    const pick = chooseHdvListing(this._inventory(), { tools: TOOL_ITEMS, reserve: this._reserved() });
     if (!pick) return;
+    if (!(await this._ensureHome())) return; // Auction House is on the home map
     this._hdvBusy = true;
     this._lastHdvAt = Date.now();
     this._hdvIntent = pick;
@@ -917,9 +1047,26 @@ export class Agent {
     if (listings.length && listings[0].itemId !== intent.itemId) return;
     const tokenListings = listings.filter((l) => l.currency === 'token' && !l.mine);
     const decimals = this.hdvConfig?.decimals ?? 6;
-    const unitPrice = hdvTokenUnitPrice({ tokenListings, floorToken: 0.01, decimals });
+
+    // Detect the live market floor. Keep two memories per item:
+    //  • _mktFloor  = latest detected floor (fair price when alone),
+    //  • _mktSeen   = highest floor ever seen (sticky value anchor) so a rival
+    //    dumping cheap can't drag us down — we hold ~half the known value.
+    if (!this._mktFloor) this._mktFloor = {};
+    if (!this._mktSeen) this._mktSeen = {};
+    const detected = marketFloorToken(tokenListings, decimals);
+    if (detected != null) {
+      this._mktFloor[intent.itemId] = detected;
+      this._mktSeen[intent.itemId] = Math.max(this._mktSeen[intent.itemId] || 0, detected);
+    }
+    const anchor = this._mktSeen[intent.itemId] || 0;
+    const floorToken = Math.max(1, Math.round(anchor * 0.5)); // refuse to dump below half value
+    const fairToken = this._mktFloor[intent.itemId] ?? anchor;
+    const unitPrice = hdvTokenUnitPrice({ tokenListings, floorToken, fairToken, decimals });
     this._hdvIntent = null;
-    this._event(`🏷 listing ${intent.qty}× ${intent.itemId} @ ${(unitPrice / 10 ** decimals).toFixed(4)} $VALORA`, { notify: true });
+    const px = (unitPrice / 10 ** decimals).toFixed(0);
+    const floorMsg = detected != null ? `market floor ${detected} $VALORA` : 'no competition';
+    this._event(`🏷 listing ${intent.qty}× ${intent.itemId} @ ${px} $VALORA (${floorMsg})`, { notify: true });
     this._guardedSend('hdv_list', {
       itemId: intent.itemId,
       qty: intent.qty,
@@ -929,10 +1076,19 @@ export class Agent {
     });
   }
 
+  // The broker & Auction House live on the home map — return there if we're
+  // off mining/gathering on another map before any buy/sell/list.
+  async _ensureHome() {
+    if (this.mapId === HOME_MAP) return true;
+    if (!this.crossMapEnabled) return false;
+    return this._travelTo(HOME_MAP);
+  }
+
   async _doSell() {
     if (this.walking) return;
-    const cart = sellableCart(this._inventory(), { tools: TOOL_ITEMS });
+    const cart = sellableCart(this._inventory(), { tools: TOOL_ITEMS, keep: this._reserved() });
     if (!cart.length) return;
+    if (!(await this._ensureHome())) return;
     if (!(await this._gotoNpc(BROKER_NPC))) return;
     const total = cart.reduce((s, c) => s + c.qty, 0);
     this._event(`💰 selling ${total} items (${cart.length} types) to broker`, { notify: true });
@@ -943,6 +1099,7 @@ export class Agent {
     if (this.walking) return;
     const tool = toolToBuy({ gold: this._gold(), ownedKinds: this._ownedKinds(), prices: TOOL_PRICES });
     if (!tool) return;
+    if (!(await this._ensureHome())) return;
     if (!(await this._gotoNpc(BROKER_NPC))) return;
     this._event(`🛒 buying ${tool.id} (${tool.kind}) for ~${tool.cost}g`, { notify: true });
     this._guardedSend('econ_buy', { cart: [{ id: tool.id, qty: 1 }] });
@@ -954,6 +1111,7 @@ export class Agent {
     if (this.walking) return;
     const gear = this._gearToBuy();
     if (!gear) return;
+    if (!(await this._ensureHome())) return;
     if (!(await this._gotoNpc(BROKER_NPC))) return;
     this._event(`🛡 buying gear ${gear.id} for ~${gear.cost}g`, { notify: true });
     this._guardedSend('econ_buy', { cart: [{ id: gear.id, qty: 1 }] });

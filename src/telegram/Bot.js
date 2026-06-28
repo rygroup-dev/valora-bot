@@ -35,6 +35,7 @@ export class Bot {
       { command: 'pulse', description: '📊 Live economy' },
       { command: 'leaderboard', description: '🏆 Top players' },
       { command: 'market', description: '🛒 Item index' },
+      { command: 'travel', description: '🚪 Travel to a map (e.g. /travel mine1)' },
       { command: 'help', description: 'ℹ️ Help' },
     ]).catch(() => {});
   }
@@ -142,6 +143,14 @@ export class Bot {
         const items = await this.api.items();
         const top = items.slice(0, 15).map((i) => `${i.emoji || '•'} ${i.name} _(${i.rarityLabel || i.rarity})_ — ${i.holders ?? '?'} holders`);
         return this.send(chatId, `🛒 *Item index* (${items.length})\n${top.join('\n') || '_no data_'}`);
+      }
+      case 'travel': {
+        const a = agents.length ? agents[0] : [...this.agents.values()][0];
+        if (!a) return this.send(chatId, 'no agent');
+        const dest = arg && arg !== 'all' ? arg : 'mine1';
+        this.send(chatId, `🚪 ${a.label}: attempting travel → *${dest}* (watch /log)`);
+        const ok = await a.travelTo(dest);
+        return this.send(chatId, ok ? `✅ ${a.label} now on *${dest}*` : `❌ ${a.label} travel to *${dest}* failed (see /log)`);
       }
       default:
         return this.send(chatId, `unknown command: ${cmd}`);

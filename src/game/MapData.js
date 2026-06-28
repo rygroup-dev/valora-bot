@@ -29,6 +29,12 @@ export class MapData {
     return this.json.portals || [];
   }
 
+  // The portal on this map that leads to `mapId` (or null). Each portal is
+  // { cell, toMap, toCell, label }.
+  portalTo(mapId) {
+    return this.portals().find((p) => p.toMap === mapId) || null;
+  }
+
   // NPC id -> cell map (for quest navigation).
   npcCell(id) {
     const n = (this.json.npcs || []).find((x) => x.id === id);

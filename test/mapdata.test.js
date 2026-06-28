@@ -35,6 +35,11 @@ describe('MapData.portals', () => {
     const m = new MapData(baseMap());
     expect(m.portals()[0].toMap).toBe('mine1');
   });
+  it('portalTo finds the portal leading to a given map', () => {
+    const m = new MapData(baseMap());
+    expect(m.portalTo('mine1')).toMatchObject({ cell: 5, toMap: 'mine1', toCell: 100 });
+    expect(m.portalTo('nowhere')).toBeNull();
+  });
 });
 
 describe('MapData.pickGatherTarget', () => {

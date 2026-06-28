@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { tokenRaw, chooseHdvListing, hdvTokenUnitPrice } from '../src/game/hdv.js';
+import { tokenRaw, chooseHdvListing, hdvTokenUnitPrice, marketFloorToken } from '../src/game/hdv.js';
 
 const TOOLS = ['fishing_rod', 'bucheron_axe', 'mining_pick', 'paysan_sickle'];
 
@@ -44,5 +44,27 @@ describe('hdvTokenUnitPrice (whole-token, server requires integer >=1)', () => {
   });
   it('never goes below 1 whole token', () => {
     expect(hdvTokenUnitPrice({ tokenListings: [{ unitPrice: 1_000_000 }] })).toBe(1_000_000);
+  });
+});
+
+describe('marketFloorToken (detect the lowest live listing)', () => {
+  it('returns the lowest whole-token competitor price', () => {
+    expect(marketFloorToken([{ unitPrice: 8_000_000 }, { unitPrice: 3_000_000 }, { unitPrice: 5_000_000 }])).toBe(3);
+  });
+  it('returns null when there is no competition', () => {
+    expect(marketFloorToken([])).toBeNull();
+  });
+});
+
+describe('hdvTokenUnitPrice — market-floor aware, never dumps cheap', () => {
+  it('never undercuts below our value floor even if the market is cheaper', () => {
+    // market floor is 2 tokens but the item is worth >= 5 to us → hold the line at 5
+    expect(hdvTokenUnitPrice({ tokenListings: [{ unitPrice: 2_000_000 }], floorToken: 5 })).toBe(5_000_000);
+  });
+  it('asks a fair price (not rock bottom) when there is no competition', () => {
+    expect(hdvTokenUnitPrice({ tokenListings: [], floorToken: 1, fairToken: 4 })).toBe(4_000_000);
+  });
+  it('fair price is still bounded below by the value floor', () => {
+    expect(hdvTokenUnitPrice({ tokenListings: [], floorToken: 6, fairToken: 4 })).toBe(6_000_000);
   });
 });
