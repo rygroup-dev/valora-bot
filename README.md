@@ -26,15 +26,21 @@ clean Telegram interface.
   auto-equips stronger gear so your character keeps getting stronger.
 - **On-chain marketplace** — supports the in-game token economy (auction house,
   gold↔token, fees) with strict confirmation gates.
-- **Multi-wallet** — run several wallets at once, each as an isolated agent.
+- **Multi-account fleet** — run a **main** account plus any number of **sub**
+  accounts, each a fully isolated agent (own wallet → own sign-in → own session).
+  Generate, fund, launch and sweep sub accounts entirely from Telegram. Subs play
+  on standard servers (100-token gate) with the *same* smart/profitable brain as
+  main, while main keeps the priority server (30k gate). New subs **auto-create
+  their in-game character** — the fleet is hands-off after one command.
 - **Telegram control** — full English UI with inline buttons, live notifications
   (level-ups, gold gains, fights, disconnects), and a plain-language guide.
 - **Anti-ban & safety-first** — human-like pacing/jitter, exponential backoff,
   automatic reconnects, a global kill-switch, and a single-instance guard so the
   bot can never accidentally run doubled.
-- **Zero-mistake design** — test-driven (120+ tests), optimistic-locked saves,
-  idempotent token transactions, and **mandatory Telegram approval for any action
-  that spends tokens or gold**.
+- **Zero-mistake design** — test-driven (220+ tests), optimistic-locked saves,
+  a dependency-free Solana client with **Token-2022 transfers verified against
+  on-chain ground truth**, and **mandatory Telegram approval for any action that
+  moves on-chain value or spends gold**.
 
 ---
 
@@ -130,10 +136,32 @@ journalctl -u valora-bot -f
 | `/log` | Recent activity & events |
 | `/stop` | Emergency stop (kill-switch) |
 | `/resume` | Resume after a stop |
+| `/travel <map>` | Send an agent to another map (e.g. `/travel mine1`) |
 
-All commands accept an optional wallet label (e.g. `/status main`); the default
-is **all** wallets. Any action that moves on-chain value asks you to **Approve**
-or **Decline** first.
+### 🧬 Multi-account fleet (Telegram)
+
+Run one **main** account that funds and manages many **sub** accounts. Every
+sub plays on a standard server (just needs the 100-token gate) with the same
+brain as main. All money commands move **real on-chain value** and ask for
+**Approve / Decline** first.
+
+| Command | What it does |
+|---|---|
+| `/subacc <label> [amount]` | One-shot: generate a sub wallet, send it `amount` $VALORA from main (default 110), wait for it to confirm, then launch it live on a standard server (it auto-creates its character) |
+| `/genwallet <label>` | Just generate + save a new sub wallet (no funding) |
+| `/sendval <label> <amount>` | Send $VALORA **main → sub** (auto-creates the sub's token account) |
+| `/sendsol <label> <amount>` | Send SOL **main → sub** (needed before a sub can `/sweep`, to pay its own tx fee) |
+| `/sweep <label> [leave]` | Sweep $VALORA **sub → main**, leaving `leave` behind (default 100 so the sub keeps playing; `0` drains a retired sub) |
+
+**Typical flow:** `/subacc trader1` → approve → done. To pull profit back later:
+`/sendsol trader1 0.002` (one-time, so it can pay the fee) then
+`/sweep trader1`.
+
+> **Requirements:** your **main** wallet needs enough $VALORA to fund each sub
+> (≥100 each) plus a little SOL to pay the transfer + token-account-creation fees.
+
+All gameplay commands accept an optional wallet label (e.g. `/status main`,
+`/log trader1`); the default is **all** wallets.
 
 **Recommended first run:** keep *Safe-test mode* ON, tap *Start farming*, watch
 the *Activity log*. When you're happy, turn *Safe-test mode* OFF to play for real.
@@ -161,11 +189,13 @@ src/
   util/                logger, jitter/backoff, shard routing, single-instance lock
   wallet/              key loading, message/tx signing, multi-wallet store
   auth/                wallet sign-in, JWT cache & refresh
-  net/                 REST client, room client (reconnect bus), Solana RPC
+  net/                 REST client, room client (reconnect bus), Solana RPC,
+                       dependency-free on-chain client (SOL + Token-2022 transfers)
   game/                world model, combat, jobs, economy, progression
   brain/               ROI-gated activity scheduler
   safety/              modes, dry-run, kill-switch, confirmation gates
   state/              save manager (optimistic lock), key-value store
+  multi/               account-fleet manager (generate / fund / sweep / launch subs)
   telegram/            owner-only control UI + notifications
   Agent.js             one wallet's full runtime
   index.js             boot

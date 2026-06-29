@@ -20,6 +20,17 @@ export function pickTarget(mobs, player, { maxLevelDelta = 3, prefer = 'closest'
   return eligible.slice().sort((a, b) => (a.level || 0) - (b.level || 0))[0];
 }
 
+// Decide whether to GO LOOKING for a fight (out of combat). The live player
+// schema carries no HP out of combat (the save's 1/0 is a stale placeholder;
+// real HP is server-side at fight time), so this does NOT gate on HP — it relies
+// on the level-winnability gate plus a loss-backoff cooldown the caller passes
+// in. Returns the chosen target mob, or null when we shouldn't seek a fight.
+export function combatSeekTarget({ enabled = true, now = Date.now(), cooldownUntil = 0, mobs = [], self = {}, maxLevelDelta = 2 } = {}) {
+  if (!enabled) return null;
+  if (now < cooldownUntil) return null;
+  return pickTarget(mobs, self, { maxLevelDelta, prefer: 'weakest' });
+}
+
 export function decideFightAction(state, { healThreshold = 0.35, fleeThreshold = 0.1, heals = [] } = {}) {
   const enemies = (state.enemies || []).filter((e) => e && e.hp > 0);
   if (!enemies.length) return { type: 'none' };

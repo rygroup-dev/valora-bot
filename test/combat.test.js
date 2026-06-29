@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { pickTarget, decideFightAction } from '../src/game/combat.js';
+import { pickTarget, decideFightAction, combatSeekTarget } from '../src/game/combat.js';
 
 describe('pickTarget', () => {
   const player = { level: 10, cell: 100 };
@@ -29,6 +29,32 @@ describe('pickTarget', () => {
       { id: 'live', level: 9, cell: 120, hp: 50 },
     ];
     expect(pickTarget(mobs, player, { maxLevelDelta: 3 }).id).toBe('live');
+  });
+});
+
+describe('combatSeekTarget', () => {
+  const self = { level: 5, cell: 100 };
+  const mobs = [{ id: 'm', gid: 1, level: 5, cell: 102, hp: 30 }];
+
+  it('returns a winnable target when enabled and off cooldown', () => {
+    const t = combatSeekTarget({ enabled: true, now: 1000, cooldownUntil: 0, mobs, self, maxLevelDelta: 2 });
+    expect(t?.id).toBe('m');
+  });
+  it('does NOT gate on HP (no hp/maxHp passed in)', () => {
+    // self has no hp/maxHp at all — must still find a fight (the old bug blocked this).
+    const t = combatSeekTarget({ enabled: true, mobs, self: { level: 5, cell: 100 }, maxLevelDelta: 2 });
+    expect(t).toBeTruthy();
+  });
+  it('returns null while in the post-loss backoff cooldown', () => {
+    const t = combatSeekTarget({ enabled: true, now: 1000, cooldownUntil: 5000, mobs, self, maxLevelDelta: 2 });
+    expect(t).toBeNull();
+  });
+  it('returns null when combat is disabled', () => {
+    expect(combatSeekTarget({ enabled: false, mobs, self })).toBeNull();
+  });
+  it('returns null when the only mob is too high level', () => {
+    const hard = [{ id: 'boss', gid: 9, level: 40, cell: 101 }];
+    expect(combatSeekTarget({ enabled: true, mobs: hard, self, maxLevelDelta: 2 })).toBeNull();
   });
 });
 

@@ -4,6 +4,7 @@ import { generateWallet } from '../wallet/generate.js';
 import { VALORA } from '../game/valora.js';
 import {
   SolanaClient,
+  associatedTokenAddress,
   sendSol as chainSendSol,
   sendSplToken,
   sweepSplToken,
@@ -89,10 +90,17 @@ export class AccountManager {
 
   // sub → main : sweep VALORA, leaving `leaveUi` behind (default: the gate hold
   // so the sub keeps playing). Pass leaveUi=0 to fully drain a retired sub.
+  // The sub signs + pays this tx, so it needs a little SOL for the fee.
   async sweepVal(fromLabel, leaveUi = VALORA.gateHold) {
     const from = this.walletStore.get(fromLabel);
     if (!from) throw new Error(`no wallet '${fromLabel}'`);
     if (fromLabel === this.mainLabel) throw new Error('refusing to sweep the main wallet');
+    if (typeof this.client.getBalance === 'function') {
+      const sol = await this.client.getBalance(from.publicKey);
+      if (BigInt(sol) < 5000n) {
+        return { ok: false, reason: 'no_sol', amount: 0n, hint: `fund a little SOL first: /sendsol ${fromLabel} 0.002` };
+      }
+    }
     const leaveBaseUnits = tokenUiToBaseUnits(leaveUi);
     const res = await sweepSplToken({
       client: this.client,
@@ -103,17 +111,40 @@ export class AccountManager {
     return { ...res, ui: formatToken(res.amount ?? 0n), from: from.publicKey, label: fromLabel };
   }
 
+  // Wait until `toLabel`'s VALORA balance reaches `minBaseUnits` on-chain (the
+  // funding tx must finalize before the sub can pass the play gate). Returns the
+  // observed balance; resolves early once funded, gives up after the timeout.
+  async awaitTokenFunded(toLabel, minBaseUnits, { tries = 20, intervalMs = 3000 } = {}) {
+    const to = this.walletStore.get(toLabel);
+    if (!to) throw new Error(`no wallet '${toLabel}'`);
+    const ata = associatedTokenAddress(to.publicKey);
+    for (let i = 0; i < tries; i++) {
+      const bal = await this.client.getTokenBalanceByAta(ata);
+      if (BigInt(bal.amount) >= BigInt(minBaseUnits)) return { ok: true, amount: bal.amount };
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    const bal = await this.client.getTokenBalanceByAta(ata);
+    return { ok: BigInt(bal.amount) >= BigInt(minBaseUnits), amount: bal.amount };
+  }
+
   // Full sub-account bring-up: generate → fund VALORA (default gate hold + buffer)
-  // → optionally fund SOL → spawn the live agent.
-  async createSub(label, { val = VALORA.gateHold + 10, sol = 0 } = {}) {
+  // → wait for the funding to confirm on-chain → optionally fund SOL → spawn.
+  // Waiting matters: spawning before the VALORA confirms makes the sub fail the
+  // play gate ("insufficient hold") on its first join.
+  async createSub(label, { val = VALORA.gateHold + 10, sol = 0, waitFunding = true } = {}) {
     const gen = this.generate(label);
     const funded = await this.fundVal(label, val);
     if (!funded.ok) {
       return { ok: false, step: 'fundVal', reason: funded.reason, ...gen, want: val };
     }
+    let confirmed = true;
+    if (waitFunding) {
+      const wait = await this.awaitTokenFunded(label, tokenUiToBaseUnits(VALORA.gateHold));
+      confirmed = wait.ok;
+    }
     let solRes = null;
     if (Number(sol) > 0) solRes = await this.fundSol(label, sol);
     const spawn = await this.spawn(label);
-    return { ok: true, ...gen, val: funded.ui, valSig: funded.signature, sol: solRes?.sol, solSig: solRes?.signature, spawned: spawn.ok };
+    return { ok: true, ...gen, val: funded.ui, valSig: funded.signature, confirmed, sol: solRes?.sol, solSig: solRes?.signature, spawned: spawn.ok };
   }
 }

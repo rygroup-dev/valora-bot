@@ -8,7 +8,7 @@ import { RoomClient } from './net/RoomClient.js';
 import { Safety } from './safety/Safety.js';
 import { SaveManager } from './state/SaveManager.js';
 import { snapshot } from './game/world.js';
-import { pickTarget } from './game/combat.js';
+import { pickTarget, combatSeekTarget } from './game/combat.js';
 import { decideActivity } from './brain/Brain.js';
 import { bestLoadout, planStatAllocation } from './game/progression.js';
 import { orderShardCandidates } from './util/shards.js';
@@ -106,6 +106,20 @@ export class Agent {
     if (notify) this.bot?.broadcast(`*${this.label}* · ${text}`);
   }
 
+  // A human-ish character name, derived deterministically from the wallet pubkey
+  // so a retried create never spawns a duplicate-named character.
+  _pickCharacterName() {
+    // Server requires lowercase letters only (digits/caps → name_invalid).
+    const syl = ['vae', 'aro', 'mir', 'kae', 'nyx', 'tha', 'ryn', 'bram', 'sol', 'eld', 'fen', 'lyr', 'dor', 'wyn', 'tor', 'bel'];
+    const pk = this.wallet.publicKey || String(Math.random());
+    let h = 0;
+    for (const c of pk) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+    const a = syl[h % syl.length];
+    const b = syl[(h >> 4) % syl.length];
+    const c = syl[(h >> 9) % syl.length];
+    return (a + b + c).slice(0, 12);
+  }
+
   logText() {
     const recent = this.events.slice(-15);
     return `📜 *${this.label}* — recent activity\n${recent.length ? recent.map((e) => `\`${e}\``).join('\n') : '_(nothing yet)_'}`;
@@ -121,10 +135,36 @@ export class Agent {
     const access = await this.rest.accessCheck();
     if (!access.ok) {
       this.log(`gate failed: ${access.error || 'insufficient hold'} (minHold ${access.minHold})`);
+      // Self-heal: a freshly-funded sub account may not have confirmed on-chain
+      // yet, or the owner is about to top it up. Retry the gate with backoff
+      // instead of dying silently, so the agent comes alive once it holds enough.
+      this._gateTries = (this._gateTries || 0) + 1;
+      if (this._gateTimer) clearTimeout(this._gateTimer);
+      if (this._gateTries <= 20) {
+        this._event(`⏳ need ≥${access.minHold || VALORA.gateHold} $VALORA to play — retry ${this._gateTries}/20 in 45s`, { notify: this._gateTries === 1 });
+        this._gateTimer = setTimeout(() => this.start().catch(() => {}), 45000);
+      } else {
+        this._event('🚪 gate still failing — stopping. Fund this wallet then /resume.', { notify: true });
+      }
       return false;
     }
+    this._gateTries = 0;
+    if (this._gateTimer) { clearTimeout(this._gateTimer); this._gateTimer = null; }
 
-    const resumed = await this.rest.resumeCharacter();
+    let resumed = await this.rest.resumeCharacter();
+    if (!resumed.character && resumed.authedNoChar) {
+      // Fresh wallet (e.g. a just-funded sub account) has no character yet —
+      // auto-create one so the fleet is fully hands-off after /subacc.
+      const name = this._pickCharacterName();
+      this._event(`🧑‍🌾 no character — creating '${name}'…`, { notify: true });
+      const created = await this.rest.createCharacter(name, null, {});
+      if (created.ok) {
+        resumed = { character: created.character };
+        this._event(`✅ character '${name}' created`, { notify: true });
+      } else {
+        this.log(`character create failed: ${created.error || 'unknown'}`);
+      }
+    }
     if (resumed.character) {
       this.character = resumed.character;
       this.save.setVersion(resumed.character.version || 0);
@@ -138,7 +178,9 @@ export class Agent {
     // a smaller holder falls back to a normal shard automatically.
     const shards = await this.rest.shards();
     this._shards = shards;
-    const candidates = orderShardCandidates(shards, { preferPriority: true });
+    // Main (priority wallet) tries the gated PRIORITY shard first; sub accounts
+    // prefer standard servers (only need the 100-hold gate).
+    const candidates = orderShardCandidates(shards, { preferPriority: this.wallet.priority !== false });
     if (!candidates.length) {
       this.log('no joinable shard');
       return false;
@@ -301,9 +343,22 @@ export class Agent {
         this.fightState = null;
         this._placed = false;
         const won = m?.win ?? m?.won ?? m?.victory ?? m?.outcome === 'win';
-        if (won) this._fightsWon = (this._fightsWon || 0) + 1;
         this._applyView(m?.view);
-        this._event(won ? `⚔️ fight won${m?.xp ? ` +${m.xp}xp` : ''} [#${this._fightsWon || 0}]` : '💀 fight lost', { notify: true });
+        if (won) {
+          this._fightsWon = (this._fightsWon || 0) + 1;
+          this._combatLossStreak = 0;
+          this._event(`⚔️ fight won${m?.xp ? ` +${m.xp}xp` : ''} [#${this._fightsWon || 0}]`, { notify: true });
+        } else {
+          // Loss-backoff: after repeated losses, pause combat and return to safe
+          // gathering/quests so the bot stops bleeding until it grows stronger.
+          this._combatLossStreak = (this._combatLossStreak || 0) + 1;
+          if (this._combatLossStreak >= 2) {
+            this._combatCooldownUntil = Date.now() + 30 * 60 * 1000;
+            this._event(`💀 fight lost (${this._combatLossStreak}×) — pausing combat 30m, back to gathering`, { notify: true });
+          } else {
+            this._event('💀 fight lost', { notify: true });
+          }
+        }
       })
       .on('fight_denied', () => this.safety.recordDenied('engageFight'))
       .on('fight', (m) => this._onFight(m))
@@ -334,8 +389,11 @@ export class Agent {
     return {
       snap,
       player: {
-        hp: self.hp ?? p.hp ?? p.maxHp ?? 50,
-        maxHp: p.maxHp ?? 50,
+        // HP comes from the last fight snapshot (the only place it's exposed).
+        // While "resting", we report low HP so the Brain keeps resting; once the
+        // rest timer elapses we assume full. Before any fight, assume healthy.
+        hp: this._maxHp ? (this._hp ?? this._maxHp) : 50,
+        maxHp: this._maxHp || 50,
         level: p.level ?? self.level ?? 1,
         statPoints: this.character?.save?.player?.charac?.points ?? 0,
         podsUsed: (p.inventory || []).length,
@@ -353,11 +411,18 @@ export class Agent {
       quests: { actionable: !!this._questAction() },
       arena: { available: false },
       profit: {
-        // Only value combat when a winnable, full-HP fight is actually available.
+        // Value combat when a winnable fight is available and we're not in a
+        // post-loss backoff. HP is NOT checked here: the player schema has no HP
+        // out of combat (the save's 1/0 is a placeholder) — real HP only exists
+        // mid-fight, where the turn planner handles it.
         combatValue:
-          this.combatEnabled &&
-          (self.hp ?? p.hp ?? 50) / (p.maxHp || 50) >= 0.8 &&
-          pickTarget(snap.mobs || [], { level: p.level ?? 1, cell: this.heroCell }, { maxLevelDelta: this.combatDelta ?? 2, prefer: 'weakest' })
+          combatSeekTarget({
+            enabled: this.combatEnabled,
+            cooldownUntil: this._combatCooldownUntil || 0,
+            mobs: snap.mobs || [],
+            self: { level: p.level ?? 1, cell: this.heroCell },
+            maxLevelDelta: this.combatDelta ?? 2,
+          })
             ? 55
             : 0,
         gatherValue: canGather ? 30 : 0,
@@ -369,6 +434,12 @@ export class Agent {
   async _tick() {
     if (!this.room?.connected) {
       await sleep(1000);
+      return;
+    }
+    // While a fight is in progress it's driven entirely by `fight` events
+    // (_onFight). Don't let the normal tick fire rest/gather/econ mid-combat.
+    if (this.inFight) {
+      await sleep(800);
       return;
     }
     const ctx = this._ctx();
@@ -463,7 +534,7 @@ export class Agent {
       case 'gather':
         return this._doGather();
       case 'rest':
-        return this._guardedSend('rest_start', {});
+        return this._doRest();
       case 'bank':
         return this._doBank();
       case 'allocate_stats':
@@ -490,15 +561,36 @@ export class Agent {
     return this.room.send(action, payload);
   }
 
+  // Rest to recover HP. We can't see HP out of combat, so we rest for a fixed
+  // window then assume full (the next fight's snapshot confirms whether resting
+  // actually healed — if not, the loss-backoff keeps us safe and the logs show
+  // it). Sends rest_start once, re-sends periodically while the timer runs.
+  _doRest() {
+    const now = Date.now();
+    if (!this._restingUntil) {
+      this._restingUntil = now + 90 * 1000;
+      this._event(`🛌 resting to recover HP (${this._hp ?? '?'}/${this._maxHp ?? '?'})…`, { notify: true });
+      return this._guardedSend('rest_start', {});
+    }
+    if (now >= this._restingUntil) {
+      this._hp = this._maxHp || this._hp; // assume recovered
+      this._restingUntil = 0;
+      this._event('🟢 rested — HP assumed full, back to action');
+      return;
+    }
+    return this._guardedSend('rest_start', {});
+  }
+
   async _doCombat(ctx) {
     if (!this.combatEnabled || this.inFight || this.walking) return;
-    // Only fight at (near) full HP — never walk into a fight already hurt.
-    if (ctx.player.maxHp && ctx.player.hp / ctx.player.maxHp < 0.8) return;
+    // Respect the post-loss backoff (don't bleed into unwinnable fights).
     const mobs = ctx.snap.mobs || [];
-    // Only engage winnable fights: mobs at most `combatDelta` above our level.
-    const target = pickTarget(mobs, { ...ctx.player, cell: this.heroCell }, {
+    const target = combatSeekTarget({
+      enabled: this.combatEnabled,
+      cooldownUntil: this._combatCooldownUntil || 0,
+      mobs,
+      self: { ...ctx.player, cell: this.heroCell },
       maxLevelDelta: this.combatDelta ?? 2,
-      prefer: 'weakest',
     });
     if (!target || target.gid == null) return;
 
@@ -555,6 +647,11 @@ export class Agent {
       || fighters.find((f) => f.name === this.character?.save?.player?.name)
       || fighters.find((f) => f.team === 0);
     if (!me) return;
+
+    // HP is only observable inside a fight — capture it so the Brain can decide
+    // to rest/heal afterwards (out of combat the player schema carries no HP).
+    if (typeof me.maxHp === 'number' && me.maxHp > 0) this._maxHp = me.maxHp;
+    if (typeof me.hp === 'number') this._hp = me.hp;
 
     // Placement phase: take a start cell then ready up (once).
     if (phase === 'placement' || phase === 'place') {
@@ -1235,6 +1332,7 @@ export class Agent {
   kill(reason) {
     this.safety.kill(reason);
     this.running = false;
+    if (this._gateTimer) { clearTimeout(this._gateTimer); this._gateTimer = null; }
     this.room?.leave();
     this._event(`🛑 stopped (${reason})`, { notify: true });
   }

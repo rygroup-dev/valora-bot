@@ -301,6 +301,7 @@ export class Bot {
         if (!conf.confirmed) return this.send(chatId, '✋ cancelled');
         try {
           const r = await this.accounts.sweepVal(label, leave);
+          if (!r.ok && r.reason === 'no_sol') return this.send(chatId, `⛽ *${label}* has no SOL to pay the sweep fee.\n${r.hint}`);
           if (!r.ok) return this.send(chatId, `ℹ️ nothing to sweep (${r.reason})`);
           return this.send(chatId, `✅ swept *${r.ui} VALORA* ${label} → main\n🔗 https://solscan.io/tx/${r.signature}`);
         } catch (e) {
@@ -320,7 +321,10 @@ export class Bot {
           if (!r.ok) {
             return this.send(chatId, `❌ *${label}*: ${r.step} failed (${r.reason})\nwallet exists \`${r.pubkey}\` — top up main, then \`/sendval ${label} ${val}\` + \`/subacc ${label}\``);
           }
-          return this.send(chatId, `✅ *${label}* is LIVE on a standard server\n\`${r.pubkey}\`\n💰 funded *${r.val} VALORA*${r.sol ? ` + ${r.sol} SOL` : ''}\n🔗 https://solscan.io/tx/${r.valSig}\n\nIt plays with the same smart/profitable brain as main.`);
+          const liveLine = r.confirmed
+            ? `✅ *${label}* is LIVE on a standard server`
+            : `🟡 *${label}* created & funded — VALORA still confirming on-chain; it auto-retries the gate every 45s and goes live once it lands`;
+          return this.send(chatId, `${liveLine}\n\`${r.pubkey}\`\n💰 funded *${r.val} VALORA*${r.sol ? ` + ${r.sol} SOL` : ''}\n🔗 https://solscan.io/tx/${r.valSig}\n\nIt plays with the same smart/profitable brain as main.\n_To sweep profit back later it needs a little SOL for fees: /sendsol ${label} 0.002_`);
         } catch (e) {
           return this.send(chatId, `❌ ${e.message}`);
         }

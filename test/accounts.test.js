@@ -19,12 +19,13 @@ function makeStore(withMain = true) {
   };
 }
 
-function makeClient({ balance = 1000n * 1_000_000n, destExists = false } = {}) {
+function makeClient({ balance = 1000n * 1_000_000n, destExists = false, sol = 1_000_000n } = {}) {
   const sent = [];
   return {
     sent,
     async getLatestBlockhash() { return '11111111111111111111111111111111'; },
     async getAccountInfo() { return destExists ? { owner: 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb' } : null; },
+    async getBalance() { return BigInt(sol); },
     async getTokenBalanceByAta() { return { amount: balance, decimals: 6, uiAmount: Number(balance) / 1e6 }; },
     async sendRawTransaction(tx) { sent.push(tx); return `SIG${sent.length}`; },
   };
@@ -106,6 +107,31 @@ describe('AccountManager sweep', () => {
   it('refuses to sweep the main wallet', async () => {
     const { mgr } = makeManager();
     await expect(mgr.sweepVal('main')).rejects.toThrow();
+  });
+
+  it('refuses to sweep when the sub has no SOL for the fee', async () => {
+    const { mgr } = makeManager({ clientOpts: { sol: 0n } });
+    mgr.generate('sub1');
+    const r = await mgr.sweepVal('sub1');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('no_sol');
+    expect(r.hint).toMatch(/sendsol/);
+  });
+});
+
+describe('AccountManager.awaitTokenFunded', () => {
+  it('resolves once the on-chain balance reaches the threshold', async () => {
+    const { mgr } = makeManager(); // funded client → balance already 1000
+    mgr.generate('sub1');
+    const r = await mgr.awaitTokenFunded('sub1', 100n * 1_000_000n, { tries: 2, intervalMs: 1 });
+    expect(r.ok).toBe(true);
+  });
+
+  it('reports not-ok if the balance never reaches the threshold', async () => {
+    const { mgr } = makeManager({ clientOpts: { balance: 1n } });
+    mgr.generate('sub1');
+    const r = await mgr.awaitTokenFunded('sub1', 100n * 1_000_000n, { tries: 2, intervalMs: 1 });
+    expect(r.ok).toBe(false);
   });
 });
 

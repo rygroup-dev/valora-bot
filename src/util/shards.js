@@ -26,6 +26,9 @@ export function orderShardCandidates(shards, { preferPriority = true } = {}) {
   const normal = joinable
     .filter((s) => (Number(s.minHold) || 0) === 0)
     .sort((a, b) => (Number(b.playing) || 0) - (Number(a.playing) || 0));
+  // Priority wallets (main, 30k hold) try the gated PRIORITY shard first, then
+  // standard. Sub wallets (100 hold) get STANDARD shards only — they can't meet
+  // the priority hold gate, so never waste a join attempt on it.
   const ordered = preferPriority ? [...priority, ...normal] : normal;
   return ordered.map((s) => s.id);
 }
