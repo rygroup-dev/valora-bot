@@ -56,4 +56,27 @@ describe('live view and quest progress fallbacks', () => {
     a._noteQuestGather({ drops: [{ id: 'cereal_wheat', qty: 2 }] });
     expect(a._questAction()).toMatchObject({ type: 'craft', questId: 'Q004', step: 1, recipe: 'flour_wheat' });
   });
+
+  it('uses existing inventory to advance a stale gather quest after restart', async () => {
+    const a = makeAgent();
+    a.mapData = {};
+    a.character = { save: { player: { inventory: [{ id: 'cereal_wheat', qty: 6 }] } } };
+    a.questBook = { active: [{ id: 'Q004', step: 0 }], completed: ['Q001'] };
+
+    await a._doQuest({ type: 'gather', questId: 'Q004', step: 0, target: 'cereal_wheat', count: 4 });
+
+    expect(a._questAction()).toMatchObject({ type: 'craft', questId: 'Q004', step: 1, recipe: 'flour_wheat' });
+  });
+
+  it('buys the required gather tool before attempting a targeted quest gather', async () => {
+    const a = makeAgent();
+    a.mapData = { spots: () => [{ cell: 1, type: 'cereal', resource: 'cereal_wheat' }] };
+    a.character = { save: { player: { gold: 100, inventory: [] } } };
+    let bought = null;
+    a._doBuySpecificTool = async (id, kind) => { bought = { id, kind }; };
+
+    await a._doQuest({ type: 'gather', questId: 'Q004', step: 0, target: 'cereal_wheat', count: 4 });
+
+    expect(bought).toEqual({ id: 'paysan_sickle', kind: 'cereal' });
+  });
 });

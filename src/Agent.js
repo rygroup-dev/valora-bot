@@ -1019,7 +1019,19 @@ export class Agent {
     if (sa.type === 'gather') {
       const want = sa.target && sa.target !== '*' ? sa.target : null;
       if (want) {
+        const have = this._invQty(want);
+        if (have >= (sa.count || 1)) {
+          this._advanceQuestFloor(sa.questId, sa.step + 1);
+          this._event(`📜 ${sa.questId} inventory ${want} ${have}/${sa.count || 1} — next step`);
+          return;
+        }
         const kind = RESOURCE_KIND(want);
+        const tool = kind ? KIND_TOOL[kind] : null;
+        if (tool && !this._ownTool(tool)) {
+          if (this._gold() >= (TOOL_PRICES[tool] || 0)) return this._doBuySpecificTool(tool, kind);
+          if (!this._bumpStepTries(sa, 3)) return this._blockQuest(sa.questId, `need ${tool}`);
+          return;
+        }
         const hasSpot = this.mapData.spots(kind ? [kind] : undefined).some((s) => s.resource === want);
         if (!hasSpot) {
           // Cross-map travel (RESOURCE_MAP / _travelTo) is implemented but the
@@ -1368,6 +1380,18 @@ export class Agent {
     this._ownedTools.add(tool.id);
     // it will be equipped next tick via the gear/tool flow
     this._pendingEquip = tool.id;
+  }
+
+  async _doBuySpecificTool(id, kind = TOOL_KIND[id]) {
+    if (this.walking) return;
+    if (!id || this._ownTool(id)) return;
+    if (!(await this._ensureHome())) return;
+    if (!(await this._gotoNpc(BROKER_NPC))) return;
+    const cost = TOOL_PRICES[id] || '?';
+    this._event(`🛒 buying required tool ${id}${kind ? ` (${kind})` : ''} for ~${cost}g`, { notify: true });
+    this._guardedSend('econ_buy', { cart: [{ id, qty: 1 }] });
+    this._ownedTools.add(id);
+    this._pendingEquip = id;
   }
 
   async _doBuyHeal() {
