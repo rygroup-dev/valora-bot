@@ -2,10 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { mainMenu, modeBadge, agentRow, formatStatus } from '../src/telegram/ui.js';
 
 describe('modeBadge', () => {
-  it('shows observe/active and dry-run state', () => {
-    expect(modeBadge('observe', true)).toContain('👁');
+  it('shows simple farming/ready state', () => {
     expect(modeBadge('active', false)).toContain('⚡');
-    expect(modeBadge('active', true)).toMatch(/dry/i);
+    expect(modeBadge('observe', false)).toContain('READY');
+    expect(modeBadge('active', true)).toContain('SAFE TEST');
   });
 });
 
@@ -17,7 +17,7 @@ describe('mainMenu', () => {
     const data = flat.map((b) => b.callback_data);
     expect(data).toContain('cmd:status:all');
     expect(data).toContain('cmd:go:all');
-    expect(data).toContain('cmd:observe:all');
+    expect(data).toContain('cmd:balance:all');
     expect(data).toContain('cmd:stop:all');
   });
 

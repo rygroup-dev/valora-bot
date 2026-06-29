@@ -115,12 +115,9 @@ export class Bot {
     this.tg.setMyCommands([
       { command: 'menu', description: '🎛 Control panel' },
       { command: 'status', description: '📊 Agent status' },
-      { command: 'go', description: '⚡ Active mode (writes on)' },
-      { command: 'observe', description: '👁 Observe mode (read-only)' },
+      { command: 'go', description: '▶️ Start farming' },
       { command: 'stop', description: '🛑 Kill-switch' },
-      { command: 'resume', description: '▶️ Resume' },
       { command: 'balance', description: '💰 Gold & wallet' },
-      { command: 'dryrun', description: '🧪 Toggle dry-run' },
       { command: 'token', description: '🪙 $VALORA info & how to get it' },
       { command: 'bridge', description: '🌉 Gold ↔ $VALORA bridge status' },
       { command: 'pulse', description: '📊 Live economy' },
@@ -202,21 +199,14 @@ export class Bot {
         return this.tg.sendMessage(chatId, text, opts).catch(() => {});
       }
       case 'go':
-        agents.forEach((a) => a.setMode('active'));
-        return this.send(chatId, `⚡ active: ${agents.map((a) => a.label).join(', ')}`);
-      case 'observe':
-        agents.forEach((a) => a.setMode('observe'));
-        return this.send(chatId, `👁 observe: ${agents.map((a) => a.label).join(', ')}`);
+        agents.forEach((a) => {
+          a.setMode('active');
+          a.resume(); // clears kill-switch & restarts if stopped
+        });
+        return this.send(chatId, `▶️ farming: ${agents.map((a) => a.label).join(', ')}`);
       case 'stop':
         agents.forEach((a) => a.kill('telegram'));
         return this.send(chatId, `🛑 stopped: ${agents.map((a) => a.label).join(', ')}`);
-      case 'resume':
-        agents.forEach((a) => a.resume());
-        return this.send(chatId, `▶️ resumed: ${agents.map((a) => a.label).join(', ')}`);
-      case 'dryrun': {
-        const states = agents.map((a) => `${a.label}=${a.toggleDryRun() ? 'on' : 'off'}`);
-        return this.send(chatId, `🧪 dry-run: ${states.join(', ')}`);
-      }
       case 'balance':
         for (const a of agents) this.send(chatId, await a.balanceText());
         if (!agents.length) this.send(chatId, 'no such agent');

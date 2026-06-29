@@ -1,8 +1,8 @@
 // Pure presentation helpers for the Telegram UI (tested separately from wiring).
 
 export function modeBadge(mode, dryRun) {
-  const base = mode === 'active' ? '⚡ ACTIVE' : '👁 OBSERVE';
-  return dryRun ? `${base} · 🧪 dry-run` : base;
+  if (dryRun) return '🧪 SAFE TEST';
+  return mode === 'active' ? '⚡ FARMING' : '⏸ READY';
 }
 
 function btn(text, label, cmd) {
@@ -13,9 +13,8 @@ function btn(text, label, cmd) {
 export function agentRow(label) {
   return [
     btn(`📊 ${label}`, label, 'status'),
-    btn('⚡', label, 'go'),
-    btn('👁', label, 'observe'),
-    btn('🛑', label, 'stop'),
+    btn('▶️ Farm', label, 'go'),
+    btn('🛑 Stop', label, 'stop'),
   ];
 }
 
@@ -23,11 +22,10 @@ export function agentRow(label) {
 export function mainMenu(labels = []) {
   const rows = [
     [btn('📊 Status', 'all', 'status'), btn('💰 Balance', 'all', 'balance')],
-    [btn('⚡ Start farming', 'all', 'go'), btn('👁 Watch only', 'all', 'observe')],
-    [btn('🛑 Stop', 'all', 'stop'), btn('▶️ Resume', 'all', 'resume')],
-    [btn('🧪 Safe-test mode', 'all', 'dryrun'), btn('📜 Activity log', 'all', 'log')],
+    [btn('▶️ Start Farming', 'all', 'go'), btn('🛑 Stop', 'all', 'stop')],
+    [btn('📜 Activity Log', 'all', 'log'), btn('🔄 Refresh', 'all', 'menu')],
     [btn('🪙 $VALORA', 'all', 'token'), btn('🌉 Bridge', 'all', 'bridge'), btn('📊 Economy', 'all', 'pulse')],
-    [btn('❓ Help / Guide', 'all', 'help'), btn('🔄 Refresh', 'all', 'menu')],
+    [btn('❓ Help', 'all', 'help')],
   ];
   for (const l of labels) rows.push(agentRow(l));
   return { inline_keyboard: rows };
@@ -70,7 +68,7 @@ export function welcomeText(labels) {
     'server your token-hold qualifies for, then farms — combat, gathering,',
     'quests, crafting & economy — to grow gold and your character.',
     '',
-    '👇 *Tap a button below.* New here? Press *❓ Help / Guide*.',
+    '👇 *Tap a button below.* New here? Press *❓ Help*.',
     '',
     '🔒 _Any action that spends tokens/gold asks you to Approve first._',
   ].join('\n');
@@ -81,19 +79,12 @@ export function helpText() {
   return [
     '📖 *VALORA SENTINEL — GUIDE*',
     '',
-    '*The two main modes:*',
-    '👁 *Watch only* (`/observe`) — bot connects and watches the game but',
-    '   makes *no* moves. Safe. This is the default.',
-    '⚡ *Start farming* (`/go`) — bot plays actively (fights, gathers, etc.).',
-    '',
     '*Buttons & commands:*',
+    '▶️ *Start Farming* (`/go`) — bot plays actively (fights, gathers, etc.).',
+    '🛑 *Stop* (`/stop`) — emergency stop (kill-switch). Tap *Start Farming* to resume.',
     '📊 *Status* (`/status`) — what each bot is doing right now.',
     '💰 *Balance* (`/balance`) — gold, server tier & wallet.',
-    '🛑 *Stop* (`/stop`) — emergency stop (kill-switch).',
-    '▶️ *Resume* (`/resume`) — restart after a stop.',
-    '🧪 *Safe-test mode* (`/dryrun`) — when ON, the bot *pretends* to act',
-    '   and logs what it _would_ do, without really doing it. Great for testing.',
-    '📜 *Activity log* (`/log`) — recent actions & events.',
+    '📜 *Activity Log* (`/log`) — recent actions & events.',
     '🔄 *Refresh* (`/menu`) — reopen this panel.',
     '',
     '*Economy & token:*',
@@ -110,7 +101,6 @@ export function helpText() {
     '• 🔌 Disconnects & reconnects',
     '• ⚠️ Errors or anything needing your approval',
     '',
-    '💡 *Typical first run:* keep *Safe-test mode ON*, tap *Start farming*,',
-    'watch the *Activity log*. Happy? Turn *Safe-test mode OFF* to play for real.',
+    '💡 *Tip:* tap *Start Farming* to begin. Use *Stop* only as a kill-switch.',
   ].join('\n');
 }
