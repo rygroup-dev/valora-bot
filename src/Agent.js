@@ -88,9 +88,12 @@ export class Agent {
     this._blockedResources = new Set(); // resources too high-level for us
     this._blockedCells = new Set(); // spot cells that keep denying
     this._lastSpot = null;
-    // Combat is turn-based tactical; the fight AI is not built yet, so the bot
-    // does not auto-engage (avoids getting stuck / dying). Gather-first for now.
+    // Combat is enabled but conservative: only engage mobs at or BELOW our level
+    // (combatDelta 0). At low level with 0 allocated stats the character loses to
+    // higher packs, so until it's stronger it focuses on quests/gather to LEVEL
+    // UP, and the loss-backoff pauses combat after losses (cleared on level-up).
     this.combatEnabled = true;
+    this.combatDelta = 0;
     // Cross-map travel: gate_check → walk to portal → await-leave + re-join the
     // destination room (the anti-teleport-safe flow the live client uses). Live-
     // verified round-trip city↔mine1 with ore gathering, so it's enabled.
@@ -108,16 +111,17 @@ export class Agent {
 
   // A human-ish character name, derived deterministically from the wallet pubkey
   // so a retried create never spawns a duplicate-named character.
-  _pickCharacterName() {
+  _pickCharacterName(attempt = 0) {
     // Server requires lowercase letters only (digits/caps → name_invalid).
+    // NOTE: must use UNSIGNED shift (>>>) — a signed >> on a uint32 hash goes
+    // negative → syl[-n] = undefined → "…undefined" names → name_invalid.
     const syl = ['vae', 'aro', 'mir', 'kae', 'nyx', 'tha', 'ryn', 'bram', 'sol', 'eld', 'fen', 'lyr', 'dor', 'wyn', 'tor', 'bel'];
     const pk = this.wallet.publicKey || String(Math.random());
     let h = 0;
     for (const c of pk) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-    const a = syl[h % syl.length];
-    const b = syl[(h >> 4) % syl.length];
-    const c = syl[(h >> 9) % syl.length];
-    return (a + b + c).slice(0, 12);
+    h = (h + attempt * 0x9e3779b1) >>> 0; // perturb on collision retries
+    const at = (s) => syl[(h >>> s) % syl.length];
+    return (at(0) + at(4) + at(8) + at(12)).slice(0, 12);
   }
 
   logText() {
@@ -154,15 +158,19 @@ export class Agent {
     let resumed = await this.rest.resumeCharacter();
     if (!resumed.character && resumed.authedNoChar) {
       // Fresh wallet (e.g. a just-funded sub account) has no character yet —
-      // auto-create one so the fleet is fully hands-off after /subacc.
-      const name = this._pickCharacterName();
-      this._event(`🧑‍🌾 no character — creating '${name}'…`, { notify: true });
-      const created = await this.rest.createCharacter(name, null, {});
-      if (created.ok) {
-        resumed = { character: created.character };
-        this._event(`✅ character '${name}' created`, { notify: true });
-      } else {
-        this.log(`character create failed: ${created.error || 'unknown'}`);
+      // auto-create one so the fleet is fully hands-off after /subacc. Retry with
+      // a perturbed name if the chosen one is taken/invalid.
+      for (let attempt = 0; attempt < 6 && !resumed.character; attempt++) {
+        const name = this._pickCharacterName(attempt);
+        this._event(`🧑‍🌾 no character — creating '${name}'…`, { notify: attempt === 0 });
+        const created = await this.rest.createCharacter(name, null, {});
+        if (created.ok) {
+          resumed = { character: created.character };
+          this._event(`✅ character '${name}' created`, { notify: true });
+          break;
+        }
+        this.log(`character create '${name}' failed: ${created.error || 'unknown'}`);
+        if (created.error !== 'name_taken' && created.error !== 'name_invalid') break;
       }
     }
     if (resumed.character) {
@@ -449,6 +457,9 @@ export class Agent {
     const gold = this.character?.save?.player?.gold ?? 0;
     if (this._lastLevel != null && lvl > this._lastLevel) {
       this._event(`🎉 Level up! now level ${lvl}`, { notify: true });
+      // Stronger now — give combat another chance (clear the loss backoff).
+      this._combatCooldownUntil = 0;
+      this._combatLossStreak = 0;
     }
     if (this._lastGold != null && gold - this._lastGold >= 1000) {
       this._event(`🪙 +${(gold - this._lastGold).toLocaleString()} gold (total ${gold.toLocaleString()})`, { notify: true });
@@ -568,7 +579,7 @@ export class Agent {
   _doRest() {
     const now = Date.now();
     if (!this._restingUntil) {
-      this._restingUntil = now + 90 * 1000;
+      this._restingUntil = now + 180 * 1000; // give HP time to actually recover
       this._event(`🛌 resting to recover HP (${this._hp ?? '?'}/${this._maxHp ?? '?'})…`, { notify: true });
       return this._guardedSend('rest_start', {});
     }
