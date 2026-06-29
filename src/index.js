@@ -3,6 +3,7 @@ import { WalletStore } from './wallet/WalletStore.js';
 import { Store } from './state/Store.js';
 import { Agent } from './Agent.js';
 import { Bot } from './telegram/Bot.js';
+import { AccountManager } from './multi/Accounts.js';
 import { acquireLock, releaseLock } from './util/singleton.js';
 
 const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
@@ -29,6 +30,11 @@ async function main() {
   // Telegram first so agents can request confirmations during startup.
   const bot = new Bot({ token: config.telegram.token, owners: config.telegram.owners, agents, log, base: config.base });
   if (!config.telegram.token) log('telegram disabled (no token) — control via process only');
+
+  // Multi-account fleet manager (generate/fund/sweep/launch sub accounts).
+  // bot ↔ accounts is circular, so back-link after construction.
+  const accounts = new AccountManager({ walletStore, agents, config, store, bot, log });
+  bot.accounts = accounts;
 
   for (const wallet of walletStore.all()) {
     const agent = new Agent({ wallet, config, store, bot, log });

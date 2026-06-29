@@ -18,9 +18,14 @@ function parseSecret(key) {
 }
 
 export class Wallet {
-  constructor({ label, key, telegramTag } = {}) {
+  constructor({ label, key, telegramTag, priority } = {}) {
     this.label = label;
     this.telegramTag = telegramTag;
+    // Server routing intent: the `main` wallet (30k holder) stays on the
+    // priority shard; sub wallets default to standard servers. An explicit
+    // `priority` flag in the wallet entry overrides the label heuristic.
+    this.priority = priority != null ? !!priority : label === 'main';
+    this.isMain = label === 'main';
     this._kp = parseSecret(key);
     this.publicKey = bs58.encode(this._kp.publicKey);
   }
@@ -42,5 +47,12 @@ export class Wallet {
 
   get secretKeyBytes() {
     return this._kp.secretKey;
+  }
+
+  // Base58 of the 64-byte secret (Solana format) — used to persist a generated
+  // wallet back into wallets.json. Never logged; only written to the gitignored
+  // wallet file.
+  get secretKeyB58() {
+    return bs58.encode(this._kp.secretKey);
   }
 }

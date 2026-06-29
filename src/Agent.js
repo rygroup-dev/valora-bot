@@ -84,6 +84,7 @@ export class Agent {
     this.walking = false;
     this.gatherKinds = ['wood', 'fish', 'mineral'];
     this._disabledKinds = new Set(); // gather types we lack the tool for
+    this._ownedTools = new Set(); // tools we've ever observed/bought (view can go stale)
     this._blockedResources = new Set(); // resources too high-level for us
     this._blockedCells = new Set(); // spot cells that keep denying
     this._lastSpot = null;
@@ -198,13 +199,29 @@ export class Agent {
           }
         }
       })
-      .on('hdv_config', (m) => (this.hdvConfig = m))
+      .on('hdv_config', (m) => {
+        this.hdvConfig = m;
+        const bridge = !!(m?.goldBridge ?? this.econConfig?.goldBridge);
+        this._event(`🌉 bridge=${bridge ? 'ON' : 'off'}${m?.tokenUsd ? ` · $VALORA≈$${m.tokenUsd}` : ''}${m?.goldPerToken ? ` · ${m.goldPerToken} gold/token` : ''}`);
+      })
       .on('hdv_listings', (m) => this._onHdvListings(m))
       .on('hdv_result', (m) => {
         if (m?.op === 'list') {
           this._hdvBusy = false;
-          if (m.ok) this._event(`🏷 listed on HDV for $VALORA`, { notify: true });
-          else this._event(`hdv list: ${m.error}`);
+          if (m.ok) {
+            // A successful listing consumes one marketplace slot; avoid hammering
+            // HDV and let normal farming/selling continue between listings.
+            this._hdvCooldownUntil = Date.now() + 2 * 60 * 1000;
+            this._event(`🏷 listed on HDV for $VALORA`, { notify: true });
+          } else if (m?.error === 'too_many_listings') {
+            // Marketplace slots are full. Re-trying every 2 minutes was wedging
+            // the autopilot into HDV spam with no profit. Cool down and let the
+            // bot keep farming / broker-selling until a listing sells or time passes.
+            this._hdvCooldownUntil = Date.now() + 60 * 60 * 1000;
+            this._event('hdv list: too_many_listings — cooling down HDV for 60m, continuing broker/gather loop');
+          } else {
+            this._event(`hdv list: ${m.error}`);
+          }
         }
       })
       .on('hdv_sold', (m) => this._event(`💸 HDV sale: ${m?.itemId || ''} for ${m?.currency === 'token' ? '$VALORA' : 'gold'}`, { notify: true }))
@@ -256,12 +273,19 @@ export class Agent {
         const reason = m?.reason || JSON.stringify(m);
         const spot = this._lastSpot;
         if (reason === 'tool') {
-          // Genuinely no tool for this whole resource type → skip it (notify once).
           const type = spot?.type;
-          if (type && !this._disabledKinds.has(type)) {
+          const tool = KIND_TOOL[type];
+          // If we actually own this tool, the denial is transient (the equip
+          // hadn't landed yet, e.g. right after a cross-map rejoin refreshed the
+          // view) — re-equip and retry the cell instead of disabling the kind.
+          if (tool && this._ownTool(tool)) {
+            this._pendingEquip = tool;
+            if (spot?.cell != null) this._blockedCells.add(spot.cell);
+          } else if (type && !this._disabledKinds.has(type)) {
+            // Genuinely no tool for this resource type → skip it (notify once).
             this._disabledKinds.add(type);
-            const tool = { wood: 'an axe', fish: 'a fishing rod', mineral: 'a pickaxe', cereal: 'a sickle' }[type] || 'a tool';
-            this._event(`⛔ can't gather ${type}: need ${tool} — skipping it.`, { notify: true });
+            const label = { wood: 'an axe', fish: 'a fishing rod', mineral: 'a pickaxe', cereal: 'a sickle' }[type] || 'a tool';
+            this._event(`⛔ can't gather ${type}: need ${label} — skipping it.`, { notify: true });
           }
         } else if (reason === 'level' || reason === 'skill') {
           // This particular resource is too high-level — skip it, try others (no spam).
@@ -324,7 +348,9 @@ export class Agent {
           weights: GEAR_WEIGHTS,
           level: p.level ?? 1,
         }).length > 0,
-      quests: { actionable: (p.quests?.active || []).length > 0 },
+      // Only "actionable" when a concrete quest step is available — otherwise the
+      // Brain would pick a no-op 'quest' (all remaining blocked) and starve gather.
+      quests: { actionable: !!this._questAction() },
       arena: { available: false },
       profit: {
         // Only value combat when a winnable, full-HP fight is actually available.
@@ -358,6 +384,19 @@ export class Agent {
     }
     this._lastLevel = lvl;
     this._lastGold = gold;
+
+    // Periodic self-heal: clear transient cell blocks and re-enable any gather
+    // kind whose tool we actually own (recovers from stale-view/transient denials
+    // without waiting for a restart). Level-blocked resources stay excluded via
+    // _blockedResources, so clearing _blockedCells is safe.
+    if (Date.now() - (this._lastHeal || 0) > 5 * 60 * 1000) {
+      this._lastHeal = Date.now();
+      this._blockedCells.clear();
+      for (const kind of [...this._disabledKinds]) {
+        const tool = KIND_TOOL[kind];
+        if (tool && this._ownTool(tool)) this._disabledKinds.delete(kind);
+      }
+    }
 
     // Critical safety: if the bag is (nearly) full, sell BEFORE anything else so
     // we can never wedge unable to gather — even mid-quest. _doSell returns home
@@ -569,15 +608,32 @@ export class Agent {
     setTimeout(() => this._sendActs(acts, i + 1), jitter(500, 1000));
   }
 
-  // Resource kinds we actually own a tool for (equipped or in inventory).
-  _toolKinds() {
-    const kinds = new Set();
+  // Remember tools we've ever seen in inventory/equipped — the server view can
+  // go briefly stale (e.g. right after a cross-map rejoin), and a tool isn't
+  // something we lose, so this set is the reliable source of "do we own it".
+  _noteOwnedTools() {
     const scan = (it) => {
       const id = String(typeof it === 'string' ? it : it?.id || it?.item || '');
-      for (const [tool, kind] of Object.entries(TOOL_KIND)) if (id.includes(tool)) kinds.add(kind);
+      for (const t of TOOL_ITEMS) if (id.includes(t)) this._ownedTools.add(t);
     };
     this._inventory().forEach(scan);
     Object.values(this._equipped()).forEach(scan);
+  }
+  // Do we own this tool? (view OR remembered — survives a stale view.)
+  _ownTool(toolId) {
+    if (this._ownedTools.has(toolId)) return true;
+    if (this._invHas(toolId) || this._weaponEquipped() === toolId) {
+      this._ownedTools.add(toolId);
+      return true;
+    }
+    return false;
+  }
+
+  // Resource kinds we actually own a tool for (equipped, in inventory, or known).
+  _toolKinds() {
+    this._noteOwnedTools();
+    const kinds = new Set();
+    for (const t of this._ownedTools) if (TOOL_KIND[t]) kinds.add(TOOL_KIND[t]);
     return kinds;
   }
 
@@ -657,6 +713,7 @@ export class Agent {
     if (!view) return;
     if (view.inventory) this._serverInventory = view.inventory;
     if (view.equipped) this._serverEquipped = view.equipped;
+    this._noteOwnedTools(); // remember tools before any view can go stale
     if (view.pods) this._pods = view.pods; // {used,max}
     if (typeof view.gold === 'number' && this.character?.save?.player) {
       this.character.save.player.gold = view.gold;
@@ -707,9 +764,9 @@ export class Agent {
   _ensureWeapon(id) {
     if (!id) return true;
     if (this._weaponEquipped() === id) return true;
-    if (!this._invHas(id)) return true; // not owned — proceed with whatever we have
+    if (!this._invHas(id) && !this._ownTool(id)) return true; // truly not owned — proceed
     this._guardedSend('econ_equip', { id });
-    return false;
+    return false; // equip in flight; harvest resumes next tick once confirmed
   }
   // Equip one not-yet-equipped armor piece (distinct slots). Returns true if it acted.
   _equipArmorOnce() {
@@ -853,7 +910,10 @@ export class Agent {
 
     // Periodically list a stack on the Auction House for $VALORA (token income).
     // $VALORA goes to the user's real wallet, so HDV is the profit-priority path.
-    const hdvReady = Date.now() - (this._lastHdvAt || 0) > 120000;
+    // Respect both the inter-listing spacing AND the cooldown set when the
+    // marketplace is full (too_many_listings) — otherwise we spam doomed lists.
+    const now = Date.now();
+    const hdvReady = now - (this._lastHdvAt || 0) > 120000 && now >= (this._hdvCooldownUntil || 0);
     if (!this._hdvBusy && hdvReady && this.hdvConfig?.tokenItems && chooseHdvListing(this._inventory(), { tools: TOOL_ITEMS, reserve })) {
       return 'hdv_list';
     }
@@ -1103,6 +1163,7 @@ export class Agent {
     if (!(await this._gotoNpc(BROKER_NPC))) return;
     this._event(`🛒 buying ${tool.id} (${tool.kind}) for ~${tool.cost}g`, { notify: true });
     this._guardedSend('econ_buy', { cart: [{ id: tool.id, qty: 1 }] });
+    this._ownedTools.add(tool.id);
     // it will be equipped next tick via the gear/tool flow
     this._pendingEquip = tool.id;
   }

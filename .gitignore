@@ -9,3 +9,7 @@ data/*.lock
 *.log
 .DS_Store
 data/maps/
+
+# editor/agent backups
+*.bak
+*.bak-*

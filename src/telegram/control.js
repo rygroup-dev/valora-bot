@@ -11,7 +11,7 @@ export function parseCommand(text) {
   if (typeof text !== 'string' || !text.startsWith('/')) return null;
   const [head, ...rest] = text.trim().slice(1).split(/\s+/);
   const cmd = head.split('@')[0];
-  return { cmd, arg: rest[0] };
+  return { cmd, arg: rest[0], args: rest };
 }
 
 let _seq = 0;

@@ -15,17 +15,14 @@
     "wallet:new": "node scripts/new-wallet.js"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.95.3",
-    "@solana/spl-token": "^0.4.8",
     "bs58": "^6.0.0",
     "colyseus.js": "^0.16.0",
     "dotenv": "^16.4.5",
-    "node-telegram-bot-api": "^0.66.0",
     "tweetnacl": "^1.0.3",
     "undici": "^6.19.8",
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "vitest": "^2.1.1"
+    "vitest": "^4.1.9"
   }
 }

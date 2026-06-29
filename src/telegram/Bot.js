@@ -1,19 +1,110 @@
-import TelegramBot from 'node-telegram-bot-api';
 import { isOwner, parseCommand, ConfirmRegistry } from './control.js';
 import { mainMenu, confirmKeyboard, formatStatus, welcomeText, helpText } from './ui.js';
 import { PublicApi, formatPulse, formatLeaderboard } from '../net/PublicApi.js';
+import { VALORA } from '../game/valora.js';
+
+// Tiny Telegram Bot API client using native fetch + long polling.
+// Replaces node-telegram-bot-api/request stack to remove legacy dependency CVEs.
+class NativeTelegramBot {
+  constructor(token, { polling = false, log = console.log } = {}) {
+    this.token = token;
+    this.log = log;
+    this.base = `https://api.telegram.org/bot${token}`;
+    this.handlers = new Map();
+    this.offset = 0;
+    this.polling = false;
+    if (polling) this.startPolling();
+  }
+
+  on(type, fn) {
+    if (!this.handlers.has(type)) this.handlers.set(type, []);
+    this.handlers.get(type).push(fn);
+    return this;
+  }
+
+  async _api(method, body = {}) {
+    const res = await fetch(`${this.base}/${method}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || json.ok === false) {
+      const msg = json.description || `${method} failed (${res.status})`;
+      throw new Error(msg);
+    }
+    return json.result;
+  }
+
+  setMyCommands(commands) {
+    return this._api('setMyCommands', { commands });
+  }
+
+  sendMessage(chatId, text, opts = {}) {
+    return this._api('sendMessage', { chat_id: chatId, text, ...opts });
+  }
+
+  editMessageText(text, opts = {}) {
+    return this._api('editMessageText', { text, ...opts });
+  }
+
+  answerCallbackQuery(id, opts = {}) {
+    return this._api('answerCallbackQuery', { callback_query_id: id, ...opts });
+  }
+
+  startPolling() {
+    if (this.polling) return;
+    this.polling = true;
+    this._pollLoop();
+  }
+
+  stopPolling() {
+    this.polling = false;
+  }
+
+  async _pollLoop() {
+    while (this.polling) {
+      try {
+        const updates = await this._api('getUpdates', {
+          offset: this.offset,
+          timeout: 30,
+          allowed_updates: ['message', 'callback_query'],
+        });
+        for (const u of updates || []) {
+          this.offset = Math.max(this.offset, u.update_id + 1);
+          if (u.message) this._emit('message', u.message);
+          if (u.callback_query) this._emit('callback_query', u.callback_query);
+        }
+      } catch (e) {
+        this.log(`[telegram] polling error: ${e?.message || e}`);
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
+  }
+
+  _emit(type, payload) {
+    for (const fn of this.handlers.get(type) || []) {
+      try {
+        fn(payload);
+      } catch (e) {
+        this.log(`[telegram] handler error: ${e?.message || e}`);
+      }
+    }
+  }
+}
 
 // Owner-only Telegram control surface with inline-keyboard UI.
 // Commands work as slash commands AND as tappable buttons. Commands address
 // agents by label (default: all). Risky actions request inline confirmation.
 export class Bot {
-  constructor({ token, owners, agents, log = console.log, base = 'https://valora.gg/play' }) {
+  constructor({ token, owners, agents, log = console.log, base = 'https://valora.gg/play', accounts = null }) {
     this.owners = owners;
     this.agents = agents; // Map<label, Agent>
+    this.accounts = accounts; // AccountManager (multi-account fleet) — optional
     this.log = log;
     this.confirms = new ConfirmRegistry();
     this.api = new PublicApi({ base });
-    this.tg = token ? new TelegramBot(token, { polling: true }) : null;
+    this.tg = token ? new NativeTelegramBot(token, { polling: true, log }) : null;
     if (this.tg) {
       this._wire();
       this._setCommands();
@@ -36,6 +127,11 @@ export class Bot {
       { command: 'leaderboard', description: '🏆 Top players' },
       { command: 'market', description: '🛒 Item index' },
       { command: 'travel', description: '🚪 Travel to a map (e.g. /travel mine1)' },
+      { command: 'subacc', description: '🧬 Create+fund+launch a sub account' },
+      { command: 'genwallet', description: '🔑 Generate a sub wallet (no funding)' },
+      { command: 'sendval', description: '🪙 Send $VALORA main→sub' },
+      { command: 'sendsol', description: '◎ Send SOL main→sub' },
+      { command: 'sweep', description: '🧹 Sweep $VALORA sub→main' },
       { command: 'help', description: 'ℹ️ Help' },
     ]).catch(() => {});
   }
@@ -58,7 +154,7 @@ export class Bot {
       }
       const parsed = parseCommand(msg.text || '');
       if (!parsed) return;
-      this._run(chatId, parsed.cmd, parsed.arg).catch((e) => this.send(chatId, `error: ${e?.message}`));
+      this._run(chatId, parsed.cmd, parsed.arg, undefined, parsed.args).catch((e) => this.send(chatId, `error: ${e?.message}`));
     });
 
     this.tg.on('callback_query', (q) => {
@@ -76,7 +172,7 @@ export class Bot {
     });
   }
 
-  async _run(chatId, cmd, arg, editMsgId) {
+  async _run(chatId, cmd, arg, editMsgId, args = [arg]) {
     const agents = this._agentsFor(arg);
     switch (cmd) {
       case 'start':
@@ -151,6 +247,83 @@ export class Bot {
         this.send(chatId, `🚪 ${a.label}: attempting travel → *${dest}* (watch /log)`);
         const ok = await a.travelTo(dest);
         return this.send(chatId, ok ? `✅ ${a.label} now on *${dest}*` : `❌ ${a.label} travel to *${dest}* failed (see /log)`);
+      }
+      case 'genwallet': {
+        if (!this.accounts) return this.send(chatId, 'multi-account not configured');
+        const label = args[0];
+        if (!label) return this.send(chatId, 'usage: `/genwallet <label>`');
+        try {
+          const r = this.accounts.generate(label);
+          return this.send(chatId, `🔑 sub wallet *${r.label}* created\n\`${r.pubkey}\`\n\nFund + launch: \`/subacc ${r.label}\`  ·  or just fund: \`/sendval ${r.label} ${VALORA.gateHold + 10}\``);
+        } catch (e) {
+          return this.send(chatId, `❌ ${e.message}`);
+        }
+      }
+      case 'sendsol': {
+        if (!this.accounts) return this.send(chatId, 'multi-account not configured');
+        const [label, amt] = args;
+        if (!label || !amt) return this.send(chatId, 'usage: `/sendsol <label> <amount>`');
+        const to = this.accounts.walletStore.get(label);
+        if (!to) return this.send(chatId, `no wallet \`${label}\``);
+        const conf = await this.requestConfirm({ label: 'treasury', action: 'send SOL (on-chain)', detail: `${amt} SOL → ${label}\n\`${to.publicKey}\`` });
+        if (!conf.confirmed) return this.send(chatId, '✋ cancelled');
+        try {
+          const r = await this.accounts.fundSol(label, amt);
+          return this.send(chatId, `✅ sent *${r.sol} SOL* → *${label}*\n🔗 https://solscan.io/tx/${r.signature}`);
+        } catch (e) {
+          return this.send(chatId, `❌ send failed: ${e.message}`);
+        }
+      }
+      case 'sendval': {
+        if (!this.accounts) return this.send(chatId, 'multi-account not configured');
+        const [label, amt] = args;
+        if (!label || !amt) return this.send(chatId, 'usage: `/sendval <label> <amount>`');
+        const to = this.accounts.walletStore.get(label);
+        if (!to) return this.send(chatId, `no wallet \`${label}\``);
+        const conf = await this.requestConfirm({ label: 'treasury', action: 'send $VALORA (on-chain)', detail: `${amt} VALORA → ${label}\n\`${to.publicKey}\`` });
+        if (!conf.confirmed) return this.send(chatId, '✋ cancelled');
+        try {
+          const r = await this.accounts.fundVal(label, amt);
+          if (!r.ok) return this.send(chatId, `❌ not sent (${r.reason})`);
+          return this.send(chatId, `✅ sent *${r.ui} VALORA* → *${label}*${r.createdDestinationAta ? ' (created ATA)' : ''}\n🔗 https://solscan.io/tx/${r.signature}`);
+        } catch (e) {
+          return this.send(chatId, `❌ send failed: ${e.message}`);
+        }
+      }
+      case 'sweep': {
+        if (!this.accounts) return this.send(chatId, 'multi-account not configured');
+        const [label, leaveArg] = args;
+        if (!label) return this.send(chatId, `usage: \`/sweep <label> [leave=${VALORA.gateHold}]\``);
+        const from = this.accounts.walletStore.get(label);
+        if (!from) return this.send(chatId, `no wallet \`${label}\``);
+        const leave = leaveArg != null ? Number(leaveArg) : VALORA.gateHold;
+        const conf = await this.requestConfirm({ label: 'treasury', action: 'sweep $VALORA (on-chain)', detail: `${label} → main\nleaving ${leave} VALORA on the sub` });
+        if (!conf.confirmed) return this.send(chatId, '✋ cancelled');
+        try {
+          const r = await this.accounts.sweepVal(label, leave);
+          if (!r.ok) return this.send(chatId, `ℹ️ nothing to sweep (${r.reason})`);
+          return this.send(chatId, `✅ swept *${r.ui} VALORA* ${label} → main\n🔗 https://solscan.io/tx/${r.signature}`);
+        } catch (e) {
+          return this.send(chatId, `❌ sweep failed: ${e.message}`);
+        }
+      }
+      case 'subacc': {
+        if (!this.accounts) return this.send(chatId, 'multi-account not configured');
+        const [label, valArg] = args;
+        if (!label) return this.send(chatId, 'usage: `/subacc <label> [valoraAmount]`');
+        const val = valArg != null ? Number(valArg) : VALORA.gateHold + 10;
+        const conf = await this.requestConfirm({ label: 'treasury', action: 'create sub account', detail: `generate \`${label}\`, send ${val} VALORA from main, then go live on a standard server` });
+        if (!conf.confirmed) return this.send(chatId, '✋ cancelled');
+        this.send(chatId, `🧬 creating *${label}* …`);
+        try {
+          const r = await this.accounts.createSub(label, valArg != null ? { val } : {});
+          if (!r.ok) {
+            return this.send(chatId, `❌ *${label}*: ${r.step} failed (${r.reason})\nwallet exists \`${r.pubkey}\` — top up main, then \`/sendval ${label} ${val}\` + \`/subacc ${label}\``);
+          }
+          return this.send(chatId, `✅ *${label}* is LIVE on a standard server\n\`${r.pubkey}\`\n💰 funded *${r.val} VALORA*${r.sol ? ` + ${r.sol} SOL` : ''}\n🔗 https://solscan.io/tx/${r.valSig}\n\nIt plays with the same smart/profitable brain as main.`);
+        } catch (e) {
+          return this.send(chatId, `❌ ${e.message}`);
+        }
       }
       default:
         return this.send(chatId, `unknown command: ${cmd}`);

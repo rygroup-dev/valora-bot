@@ -16,11 +16,13 @@ describe('isOwner', () => {
 
 describe('parseCommand', () => {
   it('extracts command and target label', () => {
-    expect(parseCommand('/status main')).toEqual({ cmd: 'status', arg: 'main' });
-    expect(parseCommand('/stop')).toEqual({ cmd: 'stop', arg: undefined });
+    expect(parseCommand('/status main')).toEqual({ cmd: 'status', arg: 'main', args: ['main'] });
+    expect(parseCommand('/stop')).toEqual({ cmd: 'stop', arg: undefined, args: [] });
+    // multi-arg commands expose the full args array (e.g. /sendval <label> <amt>)
+    expect(parseCommand('/sendval sub1 110')).toEqual({ cmd: 'sendval', arg: 'sub1', args: ['sub1', '110'] });
   });
   it('strips bot @mention', () => {
-    expect(parseCommand('/status@valora_bot sub1')).toEqual({ cmd: 'status', arg: 'sub1' });
+    expect(parseCommand('/status@valora_bot sub1')).toEqual({ cmd: 'status', arg: 'sub1', args: ['sub1'] });
   });
   it('returns null for non-commands', () => {
     expect(parseCommand('hello')).toBeNull();

@@ -7,6 +7,9 @@ export const config = {
   mode: process.env.MODE || 'observe',
   dryRun: String(process.env.DRY_RUN || 'true') === 'true',
   cluster: process.env.SOLANA_CLUSTER || 'mainnet-beta',
+  // Direct Solana RPC for outbound funding/sweep txs (sendTransaction). Falls
+  // back to the public cluster URL when unset. A private RPC avoids rate limits.
+  solanaRpc: process.env.SOLANA_RPC_URL || '',
 
   wallets: {
     inline: process.env.WALLETS,

@@ -2,6 +2,9 @@
 export const VALORA = {
   symbol: 'VALORA',
   mint: 'Fco8LmvTwsWi5A3TEhd9vQUnQ2BmVpYG4RjXatGUpump', // pump.fun launch, 6 decimals
+  // VALORA is a Token-2022 mint (verified on-chain: owner program TokenzQdB…).
+  // Using the classic Tokenkeg program here derives the WRONG ATA → lost funds.
+  tokenProgram: 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
   decimals: 6,
   gateHold: 100, // min hold to play
   priorityHold: 30000, // min hold for the priority shard
