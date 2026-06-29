@@ -55,12 +55,21 @@ curl -fsSL https://raw.githubusercontent.com/rygroup-dev/valora-bot/main/install
 This clones the repo into `~/valora-bot`, installs dependencies, and creates your
 config files from the templates.
 
+### Update an existing clone
+
+```bash
+cd ~/valora-bot && git pull --ff-only && npm ci && npm test
+```
+
+This pulls the latest bot code, installs the exact locked dependency versions,
+and verifies the install before you run it.
+
 ### Manual
 
 ```bash
 git clone https://github.com/rygroup-dev/valora-bot.git
 cd valora-bot
-npm install
+npm ci
 cp .env.example .env
 cp data/wallets.json.example data/wallets.json
 ```

@@ -3,6 +3,67 @@
 
 const QUEST_PREFIXES = ['quest_'];
 
+// Valora has no literal "potion" items in the live client. HP sustain comes
+// from consumables (mostly bread / cooked food). Broker buy price is the item
+// sell value multiplied by the vendor markup (4x in the live bundle).
+export const HEAL_CONSUMABLES = [
+  { id: 'bread_country', heal: 20, cost: 48 },
+  { id: 'bread_barley', heal: 40, cost: 104 },
+  { id: 'dish_boar_roast', heal: 55, cost: 96 },
+  { id: 'dish_gudgeon_snack', heal: 45, cost: 120 },
+  { id: 'bread_oat_flat', heal: 65, cost: 176 },
+  { id: 'dish_trout_pie', heal: 75, cost: 152 },
+  { id: 'dish_wolf_stew', heal: 90, cost: 144 },
+  { id: 'bread_peasant', heal: 90, cost: 280 },
+  { id: 'bread_rye', heal: 115, cost: 440 },
+  { id: 'dish_carp_pie', heal: 130, cost: 360 },
+  { id: 'bread_full', heal: 155, cost: 480 },
+  { id: 'bread_miller', heal: 160, cost: 540 },
+  { id: 'bread_corn_flat', heal: 195, cost: 1000 },
+  { id: 'dish_swordfish_feast', heal: 260, cost: 1520 },
+];
+
+export function healConsumableQty(inventory = [], ids = new Set(HEAL_CONSUMABLES.map((h) => h.id))) {
+  let qty = 0;
+  for (const it of inventory) {
+    const id = typeof it === 'string' ? it : it?.id || it?.item;
+    if (!ids.has(id)) continue;
+    qty += (typeof it === 'object' ? it.qty : 1) || 1;
+  }
+  return qty;
+}
+
+export function bestHealToUse(inventory = [], { missingHp = Infinity } = {}) {
+  const have = new Set((inventory || []).map((it) => (typeof it === 'string' ? it : it?.id || it?.item)).filter(Boolean));
+  const candidates = HEAL_CONSUMABLES
+    .filter((h) => have.has(h.id))
+    .sort((a, b) => {
+      const aWaste = Math.max(0, a.heal - missingHp);
+      const bWaste = Math.max(0, b.heal - missingHp);
+      return aWaste - bWaste || a.cost - b.cost || a.heal - b.heal;
+    });
+  return candidates[0] || null;
+}
+
+export function healConsumableToBuy({ gold = 0, inventory = [], targetQty = 6, reserveGold = 120, blocked = new Set() } = {}) {
+  if (healConsumableQty(inventory) >= targetQty) return null;
+  const budget = gold - reserveGold;
+  if (budget <= 0) return null;
+  return HEAL_CONSUMABLES
+    .filter((h) => h.cost <= budget && !blocked.has(h.id))
+    .sort((a, b) => {
+      const aValue = a.heal / Math.max(1, a.cost);
+      const bValue = b.heal / Math.max(1, b.cost);
+      return bValue - aValue || a.cost - b.cost;
+    })[0] || null;
+}
+
+export function healConsumableReserve(targetQty = 6) {
+  const keep = {};
+  for (const h of HEAL_CONSUMABLES) keep[h.id] = targetQty;
+  return keep;
+}
+
 // Cart of resources to sell — everything that isn't a tool or a quest item,
 // minus any per-item quantity we want to keep.
 export function sellableCart(inventory = [], { tools = [], keep = {} } = {}) {

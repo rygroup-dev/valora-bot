@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { sellableCart, toolToBuy } from '../src/game/vendor.js';
+import { healConsumableReserve, healConsumableToBuy, sellableCart, toolToBuy } from '../src/game/vendor.js';
 
 const TOOLS = ['bucheron_axe', 'fishing_rod', 'mining_pick', 'paysan_sickle'];
 
@@ -28,6 +28,14 @@ describe('sellableCart', () => {
     const cart = sellableCart(inv, { tools: TOOLS, keep: { fish_gudgeon: 2 } });
     expect(cart).toContainEqual({ id: 'fish_gudgeon', qty: 3 });
   });
+
+  it('reserves HP consumables from broker selling', () => {
+    const cart = sellableCart(
+      [{ id: 'bread_country', qty: 8 }, { id: 'fish_minnow', qty: 2 }],
+      { tools: TOOLS, keep: healConsumableReserve(8) },
+    );
+    expect(cart).toEqual([{ id: 'fish_minnow', qty: 2 }]);
+  });
 });
 
 describe('toolToBuy', () => {
@@ -46,5 +54,33 @@ describe('toolToBuy', () => {
     // only mineral missing, affordable
     const t = toolToBuy({ gold: 200, ownedKinds: new Set(['fish', 'wood']), prices });
     expect(t.kind).toBe('mineral');
+  });
+});
+
+describe('healConsumableToBuy', () => {
+  it('buys efficient HP food when stock is low and gold is available', () => {
+    const pick = healConsumableToBuy({ gold: 500, inventory: [], targetQty: 3, reserveGold: 100 });
+    expect(pick?.id).toBe('dish_wolf_stew');
+  });
+
+  it('does not buy HP food when target stock is already reserved', () => {
+    const pick = healConsumableToBuy({
+      gold: 500,
+      inventory: [{ id: 'bread_country', qty: 3 }],
+      targetQty: 3,
+      reserveGold: 100,
+    });
+    expect(pick).toBeNull();
+  });
+
+  it('skips blocked heal foods after the broker rejects them', () => {
+    const pick = healConsumableToBuy({
+      gold: 500,
+      inventory: [],
+      targetQty: 3,
+      reserveGold: 100,
+      blocked: new Set(['dish_wolf_stew']),
+    });
+    expect(pick?.id).toBe('dish_boar_roast');
   });
 });

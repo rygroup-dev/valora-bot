@@ -26,7 +26,11 @@ fi
 
 cd "$DIR"
 echo "📦 Installing dependencies…"
-npm install --no-audit --no-fund
+if [ -f package-lock.json ]; then
+  npm ci --no-audit --no-fund
+else
+  npm install --no-audit --no-fund
+fi
 
 [ -f .env ] || { cp .env.example .env; echo "📝 Created .env"; }
 [ -f data/wallets.json ] || { cp data/wallets.json.example data/wallets.json; echo "📝 Created data/wallets.json"; }

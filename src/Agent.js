@@ -27,7 +27,7 @@ const RESOURCE_KIND = (id) =>
   : id.startsWith('ore_') ? 'mineral'
   : id.startsWith('cereal_') ? 'cereal'
   : null;
-import { sellableCart, toolToBuy } from './game/vendor.js';
+import { bestHealToUse, healConsumableReserve, healConsumableToBuy, HEAL_CONSUMABLES, sellableCart, toolToBuy } from './game/vendor.js';
 import { planTurn } from './game/combatAI.js';
 import { chooseHdvListing, hdvTokenUnitPrice, marketFloorToken } from './game/hdv.js';
 import { questReservations } from './game/reserve.js';
@@ -39,6 +39,8 @@ const BROKER_NPC = 'broker';
 const TOOL_PRICES = { bucheron_axe: 60, mining_pick: 90, paysan_sickle: 60 };
 
 const TOOL_ITEMS = ['bucheron_axe', 'fishing_rod', 'mining_pick', 'paysan_sickle'];
+const HEAL_STOCK_TARGET = 8;
+const HEAL_BUY_RESERVE_GOLD = 120;
 // Which resource each tool can harvest.
 const TOOL_KIND = { bucheron_axe: 'wood', fishing_rod: 'fish', mining_pick: 'mineral', paysan_sickle: 'cereal' };
 const KIND_TOOL = { wood: 'bucheron_axe', fish: 'fishing_rod', mineral: 'mining_pick', cereal: 'paysan_sickle' };
@@ -246,6 +248,25 @@ export class Agent {
           this._lastCraftQuest = null;
         }
         if (m?.op === 'craft' && m.ok === false) this._event(`craft err: ${m.error}`);
+        if (m?.op === 'use' && m.ok !== false && this._lastHealUse) {
+          const heal = this._lastHealUse;
+          const before = this._hp;
+          if (this._maxHp && typeof this._hp === 'number') this._hp = Math.min(this._maxHp, this._hp + heal.heal);
+          this._event(`🍞 used ${heal.id} (+${heal.heal} HP${before == null ? '' : `, ${before}->${this._hp ?? '?'}`})`);
+          this._lastHealUse = null;
+          this._restingUntil = 0;
+        }
+        if (m?.op === 'use' && m.ok === false) {
+          if (this._lastHealUse) this._event(`heal use failed: ${this._lastHealUse.id} (${m.error || 'unknown'})`);
+          this._lastHealUse = null;
+        }
+        if (m?.op === 'buy' && m.ok === false && this._lastHealBuy) {
+          if (!this._healBuyBlocked) this._healBuyBlocked = new Set();
+          this._healBuyBlocked.add(this._lastHealBuy.id);
+          this._event(`heal buy failed: ${this._lastHealBuy.id} (${m.error || 'unknown'}), trying another food later`);
+          this._lastHealBuy = null;
+        }
+        if (m?.op === 'buy' && m.ok !== false && this._lastHealBuy) this._lastHealBuy = null;
         // Track items we can't equip yet (level-gated) so we stop retrying.
         if (m?.op === 'equip' && m?.error === 'level_req') {
           if (!this._levelBlocked) this._levelBlocked = new Set();
@@ -539,6 +560,7 @@ export class Agent {
       if (econ === 'hdv_list') return this._doHdvList();
       if (econ === 'sell') return this._doSell();
       if (econ === 'buy_tool') return this._doBuyTool();
+      if (econ === 'buy_heal') return this._doBuyHeal();
       if (econ === 'buy_gear') return this._doBuyGear();
     }
 
@@ -555,6 +577,7 @@ export class Agent {
       case 'gather':
         return this._doGather();
       case 'rest':
+        if (this._healToUse()) return this._doUseHeal();
         return this._doRest();
       case 'bank':
         return this._doBank();
@@ -713,7 +736,7 @@ export class Agent {
 
     if (this._actingTurn === state.turn) return; // already acting this turn
     this._actingTurn = state.turn;
-    const acts = planTurn({ self: { cell: myCell, ap, mp, hp, maxHp }, enemies, dist, stepToward });
+    const acts = planTurn({ self: { cell: myCell, ap, mp, hp, maxHp }, enemies, dist, stepToward }, { heals: this._healsForFight(maxHp - hp) });
     const summary = acts.map((a) => (a.spellId ? a.spellId : a.kind)).join('>');
     this._event(`🗡 turn ${state.turn} (hp ${hp}/${maxHp}, ${enemies.length} foe): ${summary}`);
     this._sendActs(acts, 0);
@@ -722,7 +745,14 @@ export class Agent {
   // Send fight acts sequentially with a small human delay between them.
   _sendActs(acts, i) {
     if (!this.inFight || i >= acts.length) return;
-    this.room.send('fightAct', acts[i]);
+    const act = acts[i];
+    if (act?.kind === 'use' && act.id) {
+      const heal = HEAL_CONSUMABLES.find((h) => h.id === act.id);
+      if (heal) this._lastHealUse = heal;
+      this._guardedSend('econ_use', { id: act.id });
+    } else {
+      this.room.send('fightAct', act);
+    }
     setTimeout(() => this._sendActs(acts, i + 1), jitter(500, 1000));
   }
 
@@ -875,6 +905,13 @@ export class Agent {
   }
   _invHas(id) {
     return this._inventory().some((it) => (typeof it === 'string' ? it : it?.id || it?.item) === id);
+  }
+  _invQty(id) {
+    return this._inventory().reduce((sum, it) => {
+      const itemId = typeof it === 'string' ? it : it?.id || it?.item;
+      if (itemId !== id) return sum;
+      return sum + ((typeof it === 'object' ? it.qty : 1) || 1);
+    }, 0);
   }
   _equippedId(slot) {
     const v = this._equipped()[slot];
@@ -1054,11 +1091,14 @@ export class Agent {
   // Items we must NOT sell because an active/upcoming quest still needs them.
   _reserved() {
     const qs = this._questState();
-    return questReservations(QUEST_CATALOG, {
+    return {
+      ...questReservations(QUEST_CATALOG, {
       active: qs.active,
       completed: qs.completed,
       blocked: qs.blocked,
-    });
+      }),
+      ...healConsumableReserve(HEAL_STOCK_TARGET),
+    };
   }
 
   // Decide a buy/sell action (string) or null.
@@ -1084,6 +1124,7 @@ export class Agent {
     if (toolToBuy({ gold: this._gold(), ownedKinds: this._ownedKinds(), prices: TOOL_PRICES })) {
       return 'buy_tool';
     }
+    if (this._healToBuy()) return 'buy_heal';
     if (this._gearToBuy()) return 'buy_gear';
     return null;
   }
@@ -1329,6 +1370,17 @@ export class Agent {
     this._pendingEquip = tool.id;
   }
 
+  async _doBuyHeal() {
+    if (this.walking) return;
+    const heal = this._healToBuy();
+    if (!heal) return;
+    if (!(await this._ensureHome())) return;
+    if (!(await this._gotoNpc(BROKER_NPC))) return;
+    this._event(`🛒 buying HP food ${heal.id} (+${heal.heal} HP) for ~${heal.cost}g`, { notify: true });
+    this._lastHealBuy = heal;
+    this._guardedSend('econ_buy', { cart: [{ id: heal.id, qty: 1 }] });
+  }
+
   async _doBuyGear() {
     if (this.walking) return;
     const gear = this._gearToBuy();
@@ -1339,6 +1391,47 @@ export class Agent {
     this._guardedSend('econ_buy', { cart: [{ id: gear.id, qty: 1 }] });
     this._boughtGear.add(gear.id);
     this._pendingEquip = gear.id;
+  }
+
+  _healToBuy() {
+    if (!this.combatEnabled) return null;
+    return healConsumableToBuy({
+      gold: this._gold(),
+      inventory: this._inventory(),
+      targetQty: HEAL_STOCK_TARGET,
+      reserveGold: HEAL_BUY_RESERVE_GOLD,
+      blocked: this._healBuyBlocked || new Set(),
+    });
+  }
+
+  _healToUse() {
+    if (!this._maxHp || typeof this._hp !== 'number') return null;
+    const missingHp = Math.max(0, this._maxHp - this._hp);
+    if (missingHp <= 0 || this._hp / this._maxHp > 0.55) return null;
+    return bestHealToUse(this._inventory(), { missingHp });
+  }
+
+  _healsForFight(missingHp = Infinity) {
+    const have = [];
+    for (const h of HEAL_CONSUMABLES) {
+      const qty = this._invQty(h.id);
+      for (let i = 0; i < qty; i++) have.push({ ...h });
+    }
+    return have
+      .sort((a, b) => {
+        const aWaste = Math.max(0, a.heal - missingHp);
+        const bWaste = Math.max(0, b.heal - missingHp);
+        return aWaste - bWaste || a.cost - b.cost;
+      })
+      .slice(0, 3);
+  }
+
+  _doUseHeal() {
+    const heal = this._healToUse();
+    if (!heal) return false;
+    this._lastHealUse = heal;
+    this._event(`🍞 HP low (${this._hp}/${this._maxHp}) — using ${heal.id} before resting`, { notify: true });
+    return this._guardedSend('econ_use', { id: heal.id });
   }
 
   // Basic broker armor/gear to make the character stronger (bought once each).

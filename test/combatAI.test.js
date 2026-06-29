@@ -23,6 +23,15 @@ describe('planTurn', () => {
     expect(acts[0]).toEqual({ kind: 'cast', spellId: 'mend', cell: 0 });
   });
 
+  it('uses a heal consumable before mend when hp is critical', () => {
+    const acts = planTurn(
+      { self: { cell: 0, ap: 6, mp: 3, hp: 10, maxHp: 50 }, enemies: [{ id: 1, cell: 4, hp: 30 }], dist, stepToward },
+      { heals: [{ id: 'bread_barley', heal: 40 }] },
+    );
+    expect(acts[0]).toEqual({ kind: 'use', id: 'bread_barley' });
+    expect(acts.some((a) => a.spellId === 'mend')).toBe(false);
+  });
+
   it('moves toward a far enemy then attacks', () => {
     // enemy at 9 (out of bolt max 6) -> move closer then bolt
     const acts = planTurn({ self: { cell: 0, ap: 6, mp: 3, hp: 50, maxHp: 50 }, enemies: [{ id: 1, cell: 9, hp: 30 }], dist, stepToward });
