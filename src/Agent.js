@@ -79,6 +79,9 @@ export class Agent {
     this._harvesting = new Set(); // cells we've started harvesting
     this._busyHarvesting = false; // true while one harvest is in progress
     this._harvestAt = 0;
+    this._questStepFloor = new Map(); // local fallback when quest sync lags
+    this._questGathered = new Map();
+    this._lastCraftQuest = null;
     this.mapData = null; // MapData for the current map (graph + spots)
     this.heroCell = null; // our current cell
     this.walking = false;
@@ -181,18 +184,18 @@ export class Agent {
       return false;
     }
 
-    // Shard auto-routing: try priority (gated) shards first; the server gates
-    // by on-chain token hold at matchmake, so a 30k holder lands on `prime`,
-    // a smaller holder falls back to a normal shard automatically.
+    // Shard routing: priority wallets stay on gated shards only; sub wallets
+    // use standard shards only. This avoids a primary wallet silently farming on
+    // a fallback shard when prime is unavailable or rejects the join.
     const shards = await this.rest.shards();
     this._shards = shards;
-    // Main (priority wallet) tries the gated PRIORITY shard first; sub accounts
-    // prefer standard servers (only need the 100-hold gate).
-    const candidates = orderShardCandidates(shards, { preferPriority: this.wallet.priority !== false });
+    const routeMode = this.wallet.priority ? 'priority' : 'standard';
+    const candidates = orderShardCandidates(shards, { mode: routeMode });
     if (!candidates.length) {
-      this.log('no joinable shard');
+      this.log(`no joinable ${routeMode} shard`);
       return false;
     }
+    this.log(`route=${routeMode} candidates=${candidates.join(',')}`);
 
     this.room = new RoomClient({
       base: this.config.base,
@@ -238,6 +241,10 @@ export class Agent {
       .on('econ_config', (m) => (this.econConfig = m))
       .on('econ_result', (m) => {
         this._applyView(m?.view);
+        if (m?.op === 'craft' && m.ok !== false && this._lastCraftQuest) {
+          this._advanceQuestFloor(this._lastCraftQuest.questId, this._lastCraftQuest.step + 1);
+          this._lastCraftQuest = null;
+        }
         if (m?.op === 'craft' && m.ok === false) this._event(`craft err: ${m.error}`);
         // Track items we can't equip yet (level-gated) so we stop retrying.
         if (m?.op === 'equip' && m?.error === 'level_req') {
@@ -283,10 +290,12 @@ export class Agent {
       .on('quest_sync', (m) => {
         this.questSync = m;
         if (m?.book) this.questBook = m.book;
+        if (m?.book) this._pruneQuestFloors(m.book);
         this._applyView(m?.view);
       })
       .on('quest_result', (m) => {
         if (m?.book) this.questBook = m.book;
+        if (m?.book) this._pruneQuestFloors(m.book);
         this._applyView(m?.view);
         if (m?.ok) this._event(`📜 quest progress${m.questId ? ` (${m.questId})` : ''}`);
       })
@@ -315,6 +324,7 @@ export class Agent {
         this._busyHarvesting = false;
         if (m?.cell != null) { this._harvesting.delete(m.cell); this._blockedCells.delete(m.cell); }
         this._event(`🌿 harvested${m?.xp ? ` +${m.xp}xp` : ''}${drops ? ` (${drops})` : ''} [#${this._gathered}]`);
+        this._noteQuestGather(m);
       })
       .on('harvest_denied', (m) => {
         this._busyHarvesting = false;
@@ -819,13 +829,19 @@ export class Agent {
   // Keep live inventory/equipped/gold from any server view payload.
   _applyView(view) {
     if (!view) return;
-    if (view.inventory) this._serverInventory = view.inventory;
-    if (view.equipped) this._serverEquipped = view.equipped;
-    this._noteOwnedTools(); // remember tools before any view can go stale
-    if (view.pods) this._pods = view.pods; // {used,max}
-    if (typeof view.gold === 'number' && this.character?.save?.player) {
-      this.character.save.player.gold = view.gold;
+    const player = view.player || view.save?.player || view.character?.save?.player || view;
+    if (this.character?.save?.player && player && typeof player === 'object') {
+      Object.assign(this.character.save.player, player);
+      if (view.save?.player?.charac) this.character.save.player.charac = view.save.player.charac;
+      if (view.character?.save?.player?.charac) this.character.save.player.charac = view.character.save.player.charac;
     }
+    if (player?.inventory) this._serverInventory = player.inventory;
+    else if (view.inventory) this._serverInventory = view.inventory;
+    if (player?.equipped) this._serverEquipped = player.equipped;
+    else if (view.equipped) this._serverEquipped = view.equipped;
+    this._noteOwnedTools(); // remember tools before any view can go stale
+    if (player?.pods) this._pods = player.pods; // {used,max}
+    else if (view.pods) this._pods = view.pods;
   }
 
   _gold() {
@@ -892,9 +908,45 @@ export class Agent {
     }
     return false;
   }
+
+  _advanceQuestFloor(questId, step) {
+    if (!questId || step == null) return;
+    const cur = this._questStepFloor.get(questId) || 0;
+    if (step > cur) this._questStepFloor.set(questId, step);
+  }
+
+  _pruneQuestFloors(book = {}) {
+    const active = new Map((book.active || []).map((q) => [q.id, q.step || 0]));
+    for (const [id, step] of [...this._questStepFloor.entries()]) {
+      if ((book.completed || []).includes(id) || !active.has(id) || active.get(id) >= step) {
+        this._questStepFloor.delete(id);
+      }
+    }
+  }
+
+  _noteQuestGather(result = {}) {
+    const sa = this._questAction();
+    if (!sa || sa.type !== 'gather' || !sa.target || sa.target === '*') return;
+    const drops = Array.isArray(result.drops) ? result.drops : [];
+    const qty = drops
+      .filter((d) => d?.id === sa.target)
+      .reduce((n, d) => n + (Number(d.qty) || 1), 0);
+    if (qty <= 0) return;
+    const key = `${sa.questId}:${sa.step}:${sa.target}`;
+    const total = (this._questGathered.get(key) || 0) + qty;
+    this._questGathered.set(key, total);
+    if (total >= (sa.count || 1)) {
+      this._advanceQuestFloor(sa.questId, sa.step + 1);
+      this._event(`📜 ${sa.questId} local ${sa.target} ${total}/${sa.count || 1} — next step`);
+    }
+  }
+
   _questState() {
     const q = this.questBook || this.character?.save?.player?.quests || {};
-    const active = (q.active || []).map((a) => ({ id: a.id, step: a.step || 0 }));
+    const active = (q.active || []).map((a) => ({
+      id: a.id,
+      step: Math.max(a.step || 0, this._questStepFloor.get(a.id) || 0),
+    }));
     const completed = q.completed || [];
     if (!this._blockedQuests) this._blockedQuests = new Set();
     return { active, completed, hasTool: this._hasTool(), blocked: this._blockedQuests };
@@ -962,6 +1014,7 @@ export class Agent {
       const cells = STATION_CELLS[rec.kind] || [];
       if (cells.length && !(await this._gotoNear(cells[0], 5))) return;
       this._event(`🔨 crafting ${sa.count}× ${sa.recipe} @${rec.kind} (${rec.id})`);
+      this._lastCraftQuest = sa;
       return this._guardedSend('econ_craft', { recipeId: rec.id, times: sa.count || 1 });
     }
     // Navigate to the NPC/target for accept/turnin/inspect/reach.

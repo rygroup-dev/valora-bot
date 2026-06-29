@@ -1,7 +1,18 @@
 import { MapGraph } from './MapGraph.js';
 
 // Wraps a parsed map JSON: builds the pathfinding graph and exposes gathering
-// spots (wood/fish/mineral) and portals, plus target selection for gathering.
+// spots (wood/fish/mineral/cereal) and portals, plus target selection for gathering.
+
+const CEREAL_GFX = {
+  cereal_wheat: 1000727,
+  cereal_barley: 1001172,
+  cereal_oats: 1001258,
+  cereal_corn: 1001844,
+  cereal_rye: 1001368,
+  cereal_hemp: 1000035,
+};
+
+const GFX_CEREAL = new Map(Object.entries(CEREAL_GFX).map(([resource, gfx]) => [gfx, resource]));
 
 export class MapData {
   constructor(json) {
@@ -21,6 +32,20 @@ export class MapData {
     }
     if (kinds.includes('mineral')) {
       for (const m of this.json.mineralNodes || []) out.push({ cell: m.cell, type: 'mineral', resource: m.mineral || m.ore });
+    }
+    if (kinds.includes('cereal')) {
+      const seen = new Set();
+      for (const c of this.json.cerealSpots || []) {
+        if (c.cell == null) continue;
+        seen.add(c.cell);
+        out.push({ cell: c.cell, type: 'cereal', resource: c.cereal || c.resource });
+      }
+      for (let cell = 0; cell < (this.json.cells || []).length; cell++) {
+        if (seen.has(cell)) continue;
+        const c = this.json.cells[cell] || {};
+        const resource = GFX_CEREAL.get(c.layer1) || GFX_CEREAL.get(c.layer2);
+        if (resource) out.push({ cell, type: 'cereal', resource });
+      }
     }
     return out;
   }

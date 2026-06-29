@@ -8,25 +8,26 @@ const shards = [
   { id: '3', name: 'III', playing: 50, capacity: 50, queue: 0, minHold: 0 }, // full
 ];
 
-describe('orderShardCandidates (priority-first, server enforces gate)', () => {
-  it('puts gated/priority shards first so the bot tries prime before normal', () => {
-    const order = orderShardCandidates(shards);
-    expect(order[0]).toBe('prime');
+describe('orderShardCandidates', () => {
+  it('keeps priority mode on gated shards only', () => {
+    const order = orderShardCandidates(shards, { mode: 'priority' });
+    expect(order).toEqual(['prime']);
   });
 
-  it('orders normal shards by busiest after priority ones', () => {
-    const order = orderShardCandidates(shards);
-    const normalPart = order.filter((id) => id !== 'prime');
+  it('keeps standard mode on normal shards only, ordered by busiest', () => {
+    const order = orderShardCandidates(shards, { mode: 'standard' });
     // '2' (49 playing) before '1' (18); '3' excluded (full)
-    expect(normalPart[0]).toBe('2');
-    expect(normalPart).toContain('1');
-    expect(normalPart).not.toContain('3');
+    expect(order[0]).toBe('2');
+    expect(order).toContain('1');
+    expect(order).not.toContain('prime');
+    expect(order).not.toContain('3');
   });
 
-  it('can skip priority shards when preferPriority=false', () => {
-    const order = orderShardCandidates(shards, { preferPriority: false });
-    expect(order[0]).not.toBe('prime');
-    expect(order).not.toContain('prime');
+  it('supports legacy auto mode with priority first, then normal fallback', () => {
+    const order = orderShardCandidates(shards, { mode: 'auto' });
+    expect(order[0]).toBe('prime');
+    expect(order).toContain('2');
+    expect(order).toContain('1');
   });
 
   it('orders multiple priority shards by minHold descending', () => {
@@ -35,8 +36,8 @@ describe('orderShardCandidates (priority-first, server enforces gate)', () => {
       { id: 'p2', playing: 5, capacity: 50, minHold: 50000 },
       { id: 'n', playing: 5, capacity: 50, minHold: 0 },
     ];
-    const order = orderShardCandidates(s);
-    expect(order.slice(0, 2)).toEqual(['p2', 'p1']);
+    const order = orderShardCandidates(s, { mode: 'priority' });
+    expect(order).toEqual(['p2', 'p1']);
   });
 
   it('returns empty when all shards are full', () => {

@@ -13,11 +13,12 @@ export function pickBusiestShard(shards) {
     })[0].s.id;
 }
 
-// Ordered shard candidates for try-and-fallback joining. The server enforces
-// the token-hold gate at matchmake, so we list priority (gated) shards FIRST —
-// the bot tries `prime` and only falls back to normal shards if rejected.
-// This auto-detects holding without needing the token mint client-side.
-export function orderShardCandidates(shards, { preferPriority = true } = {}) {
+// Ordered shard candidates for joining.
+// mode:
+//   priority -> gated shards only (main/primary wallet must stay on prime)
+//   standard -> normal shards only (subs)
+//   auto     -> gated first, then normal fallback (legacy probe mode)
+export function orderShardCandidates(shards, { preferPriority = true, mode } = {}) {
   if (!shards || !shards.length) return [];
   const joinable = shards.filter((s) => (Number(s.playing) || 0) < (Number(s.capacity) || Infinity));
   const priority = joinable
@@ -26,10 +27,11 @@ export function orderShardCandidates(shards, { preferPriority = true } = {}) {
   const normal = joinable
     .filter((s) => (Number(s.minHold) || 0) === 0)
     .sort((a, b) => (Number(b.playing) || 0) - (Number(a.playing) || 0));
-  // Priority wallets (main, 30k hold) try the gated PRIORITY shard first, then
-  // standard. Sub wallets (100 hold) get STANDARD shards only — they can't meet
-  // the priority hold gate, so never waste a join attempt on it.
-  const ordered = preferPriority ? [...priority, ...normal] : normal;
+  const routeMode = mode || (preferPriority ? 'auto' : 'standard');
+  const ordered =
+    routeMode === 'priority' ? priority
+    : routeMode === 'standard' ? normal
+    : [...priority, ...normal];
   return ordered.map((s) => s.id);
 }
 

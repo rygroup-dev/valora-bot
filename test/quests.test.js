@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { nextQuestAction, QUEST_CATALOG } from '../src/game/quests.js';
+import RECIPE_MAP from '../src/game/recipes.json' with { type: 'json' };
 
 describe('nextQuestAction', () => {
   it('accepts the first quest when nothing started', () => {
@@ -20,6 +21,7 @@ describe('nextQuestAction', () => {
   it('emits a craft action with the recipe', () => {
     const a = nextQuestAction({ active: [{ id: 'Q003', step: 1 }], completed: ['Q001'] });
     expect(a).toEqual({ type: 'craft', questId: 'Q003', step: 1, recipe: 'dish_gudgeon', count: 1 });
+    expect(RECIPE_MAP.dish_gudgeon).toMatchObject({ id: 'cook_fish_gudgeon', kind: 'cuisine' });
   });
 
   it('respects quest dependencies (Q005 needs Q004)', () => {

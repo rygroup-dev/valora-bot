@@ -28,6 +28,13 @@ describe('MapData.spots', () => {
     const m = new MapData(baseMap());
     expect(m.spots(['fish']).every((s) => s.type === 'fish')).toBe(true);
   });
+
+  it('detects cereal resources from map object graphics', () => {
+    const json = baseMap();
+    json.cells[42].layer1 = 1000727; // cereal_wheat in the live client bundle
+    const m = new MapData(json);
+    expect(m.spots(['cereal'])).toContainEqual({ cell: 42, type: 'cereal', resource: 'cereal_wheat' });
+  });
 });
 
 describe('MapData.portals', () => {
