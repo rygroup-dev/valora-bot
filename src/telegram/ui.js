@@ -42,6 +42,17 @@ export function confirmKeyboard(id) {
 
 const fmt = (n) => (typeof n === 'number' ? n.toLocaleString('en-US') : n);
 
+function formatHp(s) {
+  const hp = Number(s.hp);
+  const maxHp = Number(s.maxHp);
+  if (Number.isFinite(hp) && Number.isFinite(maxHp) && maxHp > 0) {
+    return ` · ❤️ ${hp}/${maxHp}`;
+  }
+  if (String(s.activity || '').includes('recover')) return ' · ❤️ recovering';
+  if (s.hp != null || s.maxHp != null) return ' · ❤️ syncing';
+  return '';
+}
+
 export function formatStatus(s) {
   const lines = [];
   const state = s.running ? '🟢 running' : '🔴 stopped';
@@ -50,7 +61,7 @@ export function formatStatus(s) {
   lines.push(`${modeBadge(s.mode, s.dryRun)}`);
   if (s.shardId) lines.push(`🗺 shard \`${s.shardId}\` · 🎯 ${s.activity || 'idle'}`);
   if (s.level != null) {
-    const hp = s.hp != null && s.maxHp != null ? ` · ❤️ ${s.hp}/${s.maxHp}` : '';
+    const hp = formatHp(s);
     lines.push(`🧙 lvl ${s.level} · 🪙 ${fmt(s.gold ?? 0)}${hp}`);
   }
   if (s.pubkey) lines.push(`👛 \`${s.pubkey.slice(0, 8)}…${s.pubkey.slice(-4)}\``);

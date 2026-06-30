@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { pickTarget, decideFightAction, combatSeekTarget } from '../src/game/combat.js';
+import { Agent } from '../src/Agent.js';
 
 describe('pickTarget', () => {
   const player = { level: 10, cell: 100 };
@@ -78,5 +79,40 @@ describe('decideFightAction', () => {
   it('passes when no enemies remain', () => {
     const state = { enemies: [], self: { hp: 50, maxHp: 100 } };
     expect(decideFightAction(state, {})).toEqual({ type: 'none' });
+  });
+});
+
+describe('Agent HP recovery gate', () => {
+  function agentWithHp(hp, maxHp = 80) {
+    return Object.assign(Object.create(Agent.prototype), {
+      _hp: hp,
+      _maxHp: maxHp,
+      _inventory: () => [],
+    });
+  }
+
+  it('requires recovery below the ready threshold', () => {
+    expect(agentWithHp(40, 80)._needsHpRecovery()).toBe(true);
+    expect(agentWithHp(75, 80)._needsHpRecovery()).toBe(true);
+  });
+
+  it('allows combat only once HP is near full', () => {
+    expect(agentWithHp(76, 80)._needsHpRecovery()).toBe(false);
+    expect(agentWithHp(80, 80)._needsHpRecovery()).toBe(false);
+  });
+
+  it('does not block first fight before any HP snapshot exists', () => {
+    const agent = Object.assign(Object.create(Agent.prototype), {});
+    expect(agent._needsHpRecovery()).toBe(false);
+  });
+
+  it('rests after startup until a first HP snapshot exists', () => {
+    const agent = Object.assign(Object.create(Agent.prototype), {
+      combatEnabled: true,
+      _startupRecoverUntil: Date.now() + 1000,
+    });
+    expect(agent._needsStartupRecovery()).toBe(true);
+    agent._maxHp = 80;
+    expect(agent._needsStartupRecovery()).toBe(false);
   });
 });

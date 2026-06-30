@@ -62,4 +62,38 @@ describe('formatStatus', () => {
     const txt = formatStatus({ label: 'sub1', running: false, mode: 'observe', connected: false });
     expect(txt).toMatch(/stopped|offline/i);
   });
+
+  it('does not render impossible HP like 1/0', () => {
+    const txt = formatStatus({
+      label: 'main',
+      running: true,
+      mode: 'active',
+      connected: true,
+      activity: 'startup_recover',
+      level: 4,
+      gold: 100,
+      hp: 1,
+      maxHp: 0,
+    });
+
+    expect(txt).not.toContain('1/0');
+    expect(txt).toContain('recovering');
+  });
+
+  it('shows HP syncing when HP fields are stale outside recovery', () => {
+    const txt = formatStatus({
+      label: 'main',
+      running: true,
+      mode: 'active',
+      connected: true,
+      activity: 'gather',
+      level: 4,
+      gold: 100,
+      hp: 1,
+      maxHp: 0,
+    });
+
+    expect(txt).not.toContain('1/0');
+    expect(txt).toContain('syncing');
+  });
 });

@@ -41,6 +41,8 @@ const TOOL_PRICES = { bucheron_axe: 60, mining_pick: 90, paysan_sickle: 60 };
 const TOOL_ITEMS = ['bucheron_axe', 'fishing_rod', 'mining_pick', 'paysan_sickle'];
 const HEAL_STOCK_TARGET = 8;
 const HEAL_BUY_RESERVE_GOLD = 120;
+const HP_READY_RATIO = 0.95;
+const HP_REST_WINDOW_MS = 5 * 60 * 1000;
 // Which resource each tool can harvest.
 const TOOL_KIND = { bucheron_axe: 'wood', fishing_rod: 'fish', mining_pick: 'mineral', paysan_sickle: 'cereal' };
 const KIND_TOOL = { wood: 'bucheron_axe', fish: 'fishing_rod', mineral: 'mining_pick', cereal: 'paysan_sickle' };
@@ -104,6 +106,7 @@ export class Agent {
     // UP, and the loss-backoff pauses combat after losses (cleared on level-up).
     this.combatEnabled = true;
     this.combatDelta = 0;
+    this._startupRecoverUntil = Date.now() + HP_REST_WINDOW_MS;
     // Cross-map travel: gate_check → walk to portal → await-leave + re-join the
     // destination room (the anti-teleport-safe flow the live client uses). Live-
     // verified round-trip city↔mine1 with ore gathering, so it's enabled.
@@ -473,20 +476,21 @@ export class Agent {
       quests: { actionable: !!this._questAction() },
       arena: { available: false },
       profit: {
-        // Value combat when a winnable fight is available and we're not in a
-        // post-loss backoff. HP is NOT checked here: the player schema has no HP
-        // out of combat (the save's 1/0 is a placeholder) — real HP only exists
-        // mid-fight, where the turn planner handles it.
+        // Value combat only when a winnable fight is available, we're not in a
+        // post-loss backoff, and the last observed fight HP is ready.
         combatValue:
-          combatSeekTarget({
-            enabled: this.combatEnabled,
-            cooldownUntil: this._combatCooldownUntil || 0,
-            mobs: snap.mobs || [],
-            self: { level: p.level ?? 1, cell: this.heroCell },
-            maxLevelDelta: this.combatDelta ?? 2,
-          })
-            ? 55
-            : 0,
+          this._needsHpRecovery()
+            || this._needsStartupRecovery()
+            ? 0
+            : combatSeekTarget({
+                enabled: this.combatEnabled,
+                cooldownUntil: this._combatCooldownUntil || 0,
+                mobs: snap.mobs || [],
+                self: { level: p.level ?? 1, cell: this.heroCell },
+                maxLevelDelta: this.combatDelta ?? 2,
+              })
+              ? 55
+              : 0,
         gatherValue: canGather ? 30 : 0,
         bestCraftProfit: 0,
       },
@@ -545,6 +549,26 @@ export class Agent {
         this.lastActivity = 'sell_full';
         return this._doSell();
       }
+    }
+
+    // Do not start more work while we know HP is still low after a fight. Live
+    // HP is only visible in combat, so once we have a snapshot we keep recovering
+    // until it is near full before letting combat/quests/economy continue.
+    if (this.safety.mode === 'active' && this._needsHpRecovery()) {
+      if (this.lastActivity !== 'hp_recover') {
+        this._event(`❤️ HP recovery gate (${this._hp}/${this._maxHp}) — healing before action`);
+      }
+      this.lastActivity = 'hp_recover';
+      if (this._healToUse()) return this._doUseHeal();
+      return this._doRest();
+    }
+
+    if (this.safety.mode === 'active' && this._needsStartupRecovery()) {
+      if (this.lastActivity !== 'startup_recover') {
+        this._event('❤️ startup HP recovery — resting before first combat');
+      }
+      this.lastActivity = 'startup_recover';
+      return this._doRest();
     }
 
     // Starter quests come first — they grant the first gathering tool, which
@@ -637,7 +661,7 @@ export class Agent {
   _doRest() {
     const now = Date.now();
     if (!this._restingUntil) {
-      this._restingUntil = now + 180 * 1000; // give HP time to actually recover
+      this._restingUntil = now + HP_REST_WINDOW_MS; // give HP time to actually recover
       this._event(`🛌 resting to recover HP (${this._hp ?? '?'}/${this._maxHp ?? '?'})…`, { notify: true });
       return this._guardedSend('rest_start', {});
     }
@@ -1533,8 +1557,17 @@ export class Agent {
   _healToUse() {
     if (!this._maxHp || typeof this._hp !== 'number') return null;
     const missingHp = Math.max(0, this._maxHp - this._hp);
-    if (missingHp <= 0 || this._hp / this._maxHp > 0.55) return null;
+    if (missingHp <= 0 || this._hp / this._maxHp >= HP_READY_RATIO) return null;
     return bestHealToUse(this._inventory(), { missingHp });
+  }
+
+  _needsHpRecovery() {
+    if (!this._maxHp || typeof this._hp !== 'number') return false;
+    return this._hp / this._maxHp < HP_READY_RATIO;
+  }
+
+  _needsStartupRecovery() {
+    return this.combatEnabled && !this._maxHp && Date.now() < (this._startupRecoverUntil || 0);
   }
 
   _healsForFight(missingHp = Infinity) {
@@ -1643,8 +1676,8 @@ export class Agent {
       activity: this.lastActivity,
       level: p.level,
       gold: p.gold,
-      hp: p.hp,
-      maxHp: p.maxHp,
+      hp: this._hp ?? p.hp,
+      maxHp: this._maxHp ?? p.maxHp,
       pubkey: this.wallet.publicKey,
     };
   }
