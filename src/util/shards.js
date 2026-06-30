@@ -18,11 +18,14 @@ export function pickBusiestShard(shards) {
 //   priority -> gated shards only (main/primary wallet must stay on prime)
 //   standard -> normal shards only (subs)
 //   auto     -> gated first, then normal fallback (legacy probe mode)
-export function orderShardCandidates(shards, { preferPriority = true, mode } = {}) {
+export function orderShardCandidates(shards, { preferPriority = true, mode, holding } = {}) {
   if (!shards || !shards.length) return [];
+  const hasHolding = Number.isFinite(Number(holding));
+  const walletHold = hasHolding ? Number(holding) : null;
   const joinable = shards.filter((s) => (Number(s.playing) || 0) < (Number(s.capacity) || Infinity));
   const priority = joinable
     .filter((s) => (Number(s.minHold) || 0) > 0)
+    .filter((s) => !hasHolding || walletHold >= (Number(s.minHold) || 0))
     .sort((a, b) => (b.minHold - a.minHold) || (Number(b.playing) || 0) - (Number(a.playing) || 0));
   const normal = joinable
     .filter((s) => (Number(s.minHold) || 0) === 0)

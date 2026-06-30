@@ -55,6 +55,10 @@ const ARMOR_ITEMS = ['oak_shield', 'travel_cape', 'enchanted_hat'];
 const STAT_BUILD = { vitalite: 0.4, force: 0.4, adresse: 0.2 };
 const GEAR_WEIGHTS = { dmg: 2, pv: 1, force: 1.5, crit: 3, adresse: 1, pa: 5, pm: 4 };
 
+export function shouldTelegramNotify(text) {
+  return /^(⚔️ engaging|⚔️ fight won|💀 fight lost|💸 HDV sale:)/.test(String(text || ''));
+}
+
 export class Agent {
   constructor({ wallet, config, store, bot, log }) {
     this.label = wallet.label;
@@ -112,7 +116,7 @@ export class Agent {
     this.events.push(`${ts} ${text}`);
     if (this.events.length > 40) this.events.shift();
     this.log(text);
-    if (notify) this.bot?.broadcast(`*${this.label}* · ${text}`);
+    if (notify && shouldTelegramNotify(text)) this.bot?.broadcast(`*${this.label}* · ${text}`);
   }
 
   // A human-ish character name, derived deterministically from the wallet pubkey
@@ -193,7 +197,8 @@ export class Agent {
     const shards = await this.rest.shards();
     this._shards = shards;
     const routeMode = this.wallet.priority ? 'priority' : 'standard';
-    const candidates = orderShardCandidates(shards, { mode: routeMode });
+    const holding = this.wallet.priority ? await this.tokenBalance().catch(() => null) : null;
+    const candidates = orderShardCandidates(shards, { mode: routeMode, holding });
     if (!candidates.length) {
       this.log(`no joinable ${routeMode} shard`);
       return false;
@@ -233,7 +238,7 @@ export class Agent {
     const shardInfo = shards.find((s) => s.id === this.shardId);
     const tier = shardInfo && shardInfo.minHold > 0 ? `👑 PRIORITY (hold ≥${shardInfo.minHold.toLocaleString()})` : 'standard';
     this.running = true;
-    this.bot?.broadcast(`▶️ ${this.label} online · shard *${shardInfo?.name || this.shardId}* (${tier}) · mode ${this.safety.mode}`);
+    this.log(`${this.label} online · shard ${shardInfo?.name || this.shardId} (${tier}) · mode ${this.safety.mode}`);
     this._loop();
     return true;
   }
@@ -241,7 +246,10 @@ export class Agent {
   _wireRoom() {
     const noop = () => {};
     this.room
-      .on('econ_config', (m) => (this.econConfig = m))
+      .on('econ_config', (m) => {
+        this.econConfig = m;
+        this._econConfigAt = Date.now();
+      })
       .on('econ_result', (m) => {
         this._applyView(m?.view);
         if (m?.op === 'craft' && m.ok !== false && this._lastCraftQuest) {
@@ -287,6 +295,7 @@ export class Agent {
       })
       .on('hdv_config', (m) => {
         this.hdvConfig = m;
+        this._hdvConfigAt = Date.now();
         const bridge = !!(m?.goldBridge ?? this.econConfig?.goldBridge);
         this._event(`🌉 bridge=${bridge ? 'ON' : 'off'}${m?.tokenUsd ? ` · $VALORA≈$${m.tokenUsd}` : ''}${m?.goldPerToken ? ` · ${m.goldPerToken} gold/token` : ''}`);
       })
@@ -1665,15 +1674,24 @@ export class Agent {
   }
 
   async bridgeText() {
-    const enabled = !!(this.hdvConfig?.goldBridge ?? this.econConfig?.goldBridge);
-    const usd = this.hdvConfig?.tokenUsd;
+    const hasConfig = !!(this.hdvConfig || this.econConfig);
+    const enabled = hasConfig ? !!(this.hdvConfig?.goldBridge ?? this.econConfig?.goldBridge) : null;
+    const usd = this.hdvConfig?.tokenUsd ?? this.econConfig?.tokenUsd;
+    const goldPerToken = this.hdvConfig?.goldPerToken ?? this.econConfig?.goldPerToken;
     const gold = this._gold();
     const bal = await this.tokenBalance();
+    const shardInfo = (this._shards || []).find((s) => s.id === this.shardId);
+    const configAt = this._hdvConfigAt || this._econConfigAt || 0;
+    const age = configAt ? Math.max(0, Math.round((Date.now() - configAt) / 1000)) : null;
+    const source = this._hdvConfigAt ? 'hdv_config' : this._econConfigAt ? 'econ_config' : 'waiting';
     const lines = [
       '🌉 *Gold ↔ $VALORA bridge*',
-      `Status: ${enabled ? '🟢 ENABLED' : '🔴 disabled (server-gated)'}`,
+      `Agent: *${this.label}* · server: ${shardInfo?.name || this.shardId || '?'}`,
+      `Status: ${enabled == null ? '🟡 syncing live config…' : enabled ? '🟢 ENABLED' : '🔴 disabled (server-gated)'}`,
+      `Data: ${source}${age == null ? '' : ` · ${age}s ago`}`,
       `🪙 gold: ${gold.toLocaleString()} · ◎ ${bal == null ? '?' : bal.toLocaleString()} $VALORA`,
       usd ? `💵 $VALORA ≈ $${usd}` : '',
+      goldPerToken ? `⚖️ Rate: ${goldPerToken.toLocaleString()} gold / $VALORA` : '',
       '',
     ];
     if (enabled) {

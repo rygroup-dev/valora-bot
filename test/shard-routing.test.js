@@ -40,6 +40,16 @@ describe('orderShardCandidates', () => {
     expect(order).toEqual(['p2', 'p1']);
   });
 
+  it('skips priority shards above the wallet token holding when known', () => {
+    const s = [
+      { id: 'apex', playing: 5, capacity: 50, minHold: 150000 },
+      { id: 'prime', playing: 5, capacity: 50, minHold: 30000 },
+      { id: 'n', playing: 5, capacity: 50, minHold: 0 },
+    ];
+    expect(orderShardCandidates(s, { mode: 'priority', holding: 31000 })).toEqual(['prime']);
+    expect(orderShardCandidates(s, { mode: 'priority', holding: 150000 })).toEqual(['apex', 'prime']);
+  });
+
   it('returns empty when all shards are full', () => {
     const full = [{ id: 'a', playing: 50, capacity: 50, minHold: 0 }];
     expect(orderShardCandidates(full)).toEqual([]);
