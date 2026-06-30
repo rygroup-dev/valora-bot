@@ -15,29 +15,12 @@ export const SPELLS = {
 
 // state: { self:{cell,ap,mp,hp,maxHp}, enemies:[{id,cell,hp}], dist(a,b), stepToward(from,target,mp) }
 // dist(a,b): cell distance. stepToward(from,target,mp): best reachable cell within mp toward target (or from).
-export function planTurn(state, { healThreshold = 0.4, itemHealThreshold = 0.3, heals = [] } = {}) {
+export function planTurn(state, { healThreshold = 0.4 } = {}) {
   const acts = [];
   const self = { ...state.self };
   const dist = state.dist || ((a, b) => Math.abs(a - b));
   const enemies = (state.enemies || []).filter((e) => e && e.hp > 0);
   if (!enemies.length) return [{ kind: 'endTurn' }];
-
-  // Use a consumable first at critical HP. The Agent sends this through the live
-  // client-equivalent econ_use endpoint, so it preserves AP for mend/attacks.
-  if (self.maxHp && self.hp / self.maxHp <= itemHealThreshold && heals.length) {
-    const missingHp = Math.max(0, self.maxHp - self.hp);
-    const heal = heals
-      .slice()
-      .sort((a, b) => {
-        const aWaste = Math.max(0, (a.heal || 0) - missingHp);
-        const bWaste = Math.max(0, (b.heal || 0) - missingHp);
-        return aWaste - bWaste || (a.heal || 0) - (b.heal || 0);
-      })[0];
-    if (heal?.id) {
-      acts.push({ kind: 'use', id: heal.id });
-      self.hp = Math.min(self.maxHp, self.hp + (heal.heal || 0));
-    }
-  }
 
   // Heal once if low and affordable.
   if (self.maxHp && self.hp / self.maxHp <= healThreshold && self.ap >= SPELLS.mend.ap) {

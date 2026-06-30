@@ -27,7 +27,7 @@ const RESOURCE_KIND = (id) =>
   : id.startsWith('ore_') ? 'mineral'
   : id.startsWith('cereal_') ? 'cereal'
   : null;
-import { bestHealToUse, healConsumableReserve, healConsumableToBuy, HEAL_CONSUMABLES, sellableCart, toolToBuy } from './game/vendor.js';
+import { bestHealToUse, healConsumableQty, healConsumableReserve, healConsumableToBuy, HEAL_CONSUMABLES, sellableCart, toolToBuy } from './game/vendor.js';
 import { planTurn } from './game/combatAI.js';
 import { chooseHdvListing, hdvTokenUnitPrice, marketFloorToken } from './game/hdv.js';
 import { questReservations } from './game/reserve.js';
@@ -48,6 +48,7 @@ const COMBAT_WEAPON = 'iron_sword';
 // Which map a resource lives on (for cross-map quest gathering).
 const RESOURCE_MAP = (id) => (id.startsWith('ore_') ? 'mine1' : null);
 const HOME_MAP = 'city'; // broker/HDV/most quest givers live here
+const ROOM_STALE_MS = 8 * 60 * 1000;
 // Armor pieces that occupy their own slots (equip once, permanent).
 const ARMOR_ITEMS = ['oak_shield', 'travel_cape', 'enchanted_hat'];
 
@@ -247,7 +248,14 @@ export class Agent {
           this._advanceQuestFloor(this._lastCraftQuest.questId, this._lastCraftQuest.step + 1);
           this._lastCraftQuest = null;
         }
-        if (m?.op === 'craft' && m.ok === false) this._event(`craft err: ${m.error}`);
+        if (m?.op === 'craft' && m.ok !== false && this._lastHealCraft) {
+          this._event(`🍳 crafted ${this._lastHealCraft.output} ×${this._lastHealCraft.times}`);
+          this._lastHealCraft = null;
+        }
+        if (m?.op === 'craft' && m.ok === false) {
+          if (this._lastHealCraft) this._lastHealCraft = null;
+          this._event(`craft err: ${m.error}`);
+        }
         if (m?.op === 'use' && m.ok !== false && this._lastHealUse) {
           const heal = this._lastHealUse;
           const before = this._hp;
@@ -404,7 +412,13 @@ export class Agent {
       .on('relocate', (m) => {
         if (typeof m?.cell === 'number') this.heroCell = m.cell;
       })
-      .on('admin_notice', (m) => this._event(`📢 ${typeof m === 'string' ? m : JSON.stringify(m)}`, { notify: true }));
+      .on('admin_notice', (m) => {
+        const text = typeof m === 'string' ? m : m?.message || JSON.stringify(m);
+        this._event(`📢 ${text}`, { notify: true });
+        if (/update complete|reload your page|server is back up/i.test(text)) {
+          setTimeout(() => this._refreshRoom('server update').catch((e) => this.log(`refresh failed: ${e?.message}`)), jitter(1200, 8000));
+        }
+      });
   }
 
   // ---------- brain loop ----------
@@ -471,6 +485,7 @@ export class Agent {
   }
 
   async _tick() {
+    await this._roomWatchdog();
     if (!this.room?.connected) {
       await sleep(1000);
       return;
@@ -560,6 +575,7 @@ export class Agent {
       if (econ === 'hdv_list') return this._doHdvList();
       if (econ === 'sell') return this._doSell();
       if (econ === 'buy_tool') return this._doBuyTool();
+      if (econ === 'craft_heal') return this._doCraftHeal();
       if (econ === 'buy_heal') return this._doBuyHeal();
       if (econ === 'buy_gear') return this._doBuyGear();
     }
@@ -1072,8 +1088,14 @@ export class Agent {
       const ok = await this._gotoNpc(npc);
       if (!ok && !this._bumpStepTries(sa)) return this._blockQuest(sa.questId, 'NPC unreachable');
     }
-    if (sa.type === 'accept') return this._guardedSend('econ_quest_accept', { questId: sa.questId });
-    if (sa.type === 'turnin') return this._guardedSend('econ_quest_turnin', { questId: sa.questId, step: sa.step });
+    if (sa.type === 'accept') {
+      if (!this._bumpStepTries(sa, 6)) return this._blockQuest(sa.questId, 'accept no response');
+      return this._guardedSend('econ_quest_accept', { questId: sa.questId });
+    }
+    if (sa.type === 'turnin') {
+      if (!this._bumpStepTries(sa, 6)) return this._blockQuest(sa.questId, 'turnin no response');
+      return this._guardedSend('econ_quest_turnin', { questId: sa.questId, step: sa.step });
+    }
     if (sa.type === 'equip') return this._equipTool();
     // inspect / reach targets aren't in the map data yet — try a turn-in, then
     // skip the quest if it won't advance so other quests can proceed.
@@ -1121,8 +1143,18 @@ export class Agent {
     const podsFull = this._podsRatio() >= 0.85;
     const manySellables = sellables.reduce((s, c) => s + c.qty, 0) >= 60;
 
+    if (sellables.length && (podsFull || manySellables)) return 'sell';
+
+    if (toolToBuy({ gold: this._gold(), ownedKinds: this._ownedKinds(), prices: TOOL_PRICES })) {
+      return 'buy_tool';
+    }
+    if (this._healToCraft()) return 'craft_heal';
+    if (this._healToBuy()) return 'buy_heal';
+    if (this._gearToBuy()) return 'buy_gear';
+
     // Periodically list a stack on the Auction House for $VALORA (token income).
-    // $VALORA goes to the user's real wallet, so HDV is the profit-priority path.
+    // $VALORA goes to the user's real wallet, but survival supplies still come
+    // first so market activity can never starve HP food.
     // Respect both the inter-listing spacing AND the cooldown set when the
     // marketplace is full (too_many_listings) — otherwise we spam doomed lists.
     const now = Date.now();
@@ -1131,14 +1163,34 @@ export class Agent {
       return 'hdv_list';
     }
 
-    if (sellables.length && (podsFull || manySellables)) return 'sell';
-
-    if (toolToBuy({ gold: this._gold(), ownedKinds: this._ownedKinds(), prices: TOOL_PRICES })) {
-      return 'buy_tool';
-    }
-    if (this._healToBuy()) return 'buy_heal';
-    if (this._gearToBuy()) return 'buy_gear';
     return null;
+  }
+
+  async _roomWatchdog() {
+    if (!this.room || this.walking || this.inFight) return;
+    const now = Date.now();
+    const last = this.room.lastMessageAt || this.room.lastJoinAt || 0;
+    if (last && now - last > ROOM_STALE_MS) {
+      await this._refreshRoom(`stale ${Math.round((now - last) / 1000)}s`);
+    }
+  }
+
+  async _refreshRoom(reason) {
+    if (!this.running || !this.room || this._roomRefreshing) return false;
+    this._roomRefreshing = true;
+    try {
+      this._event(`🔄 refreshing room (${reason})`, { notify: true });
+      const ok = await this.room.refresh(reason);
+      if (ok) {
+        this.shardId = this.room.shardId;
+        await this._syncMapAfterReconnect();
+        this._disabledKinds.clear();
+        this._blockedCells.clear();
+      }
+      return ok;
+    } finally {
+      this._roomRefreshing = false;
+    }
   }
 
   // Telemetry: observe every server message. Most are handled by named handlers;
@@ -1394,6 +1446,19 @@ export class Agent {
     this._pendingEquip = id;
   }
 
+  async _doCraftHeal() {
+    if (this.walking) return;
+    const craft = this._healToCraft();
+    if (!craft) return;
+    if (!(await this._ensureHome())) return;
+    const cells = STATION_CELLS[craft.recipe.kind] || [];
+    if (cells.length && !(await this._gotoNear(cells[0], 5))) return;
+    this._event(`🍳 crafting HP food ${craft.output} ×${craft.times} @${craft.recipe.kind}`, { notify: true });
+    this._lastHealCraft = craft;
+    this._lastHealCraftAt = Date.now();
+    this._guardedSend('econ_craft', { recipeId: craft.recipe.id, times: craft.times });
+  }
+
   async _doBuyHeal() {
     if (this.walking) return;
     const heal = this._healToBuy();
@@ -1402,6 +1467,7 @@ export class Agent {
     if (!(await this._gotoNpc(BROKER_NPC))) return;
     this._event(`🛒 buying HP food ${heal.id} (+${heal.heal} HP) for ~${heal.cost}g`, { notify: true });
     this._lastHealBuy = heal;
+    this._lastHealBuyAt = Date.now();
     this._guardedSend('econ_buy', { cart: [{ id: heal.id, qty: 1 }] });
   }
 
@@ -1419,6 +1485,7 @@ export class Agent {
 
   _healToBuy() {
     if (!this.combatEnabled) return null;
+    if (this._lastHealBuy && Date.now() - (this._lastHealBuyAt || 0) < 10000) return null;
     return healConsumableToBuy({
       gold: this._gold(),
       inventory: this._inventory(),
@@ -1426,6 +1493,32 @@ export class Agent {
       reserveGold: HEAL_BUY_RESERVE_GOLD,
       blocked: this._healBuyBlocked || new Set(),
     });
+  }
+
+  _healToCraft() {
+    if (!this.combatEnabled) return null;
+    if (this._lastHealCraft && Date.now() - (this._lastHealCraftAt || 0) < 12000) return null;
+    if (healConsumableQty(this._inventory()) >= HEAL_STOCK_TARGET) return null;
+    const inv = new Map();
+    for (const it of this._inventory()) {
+      const id = typeof it === 'string' ? it : it?.id || it?.item;
+      if (!id) continue;
+      inv.set(id, (inv.get(id) || 0) + ((typeof it === 'object' ? it.qty : 1) || 1));
+    }
+    const picks = HEAL_CONSUMABLES
+      .map((h) => ({ heal: h, recipe: RECIPE_MAP[h.id] }))
+      .filter((x) => x.recipe?.inputs?.length && this._craftJobLevelOk(x.recipe))
+      .map((x) => {
+        const times = Math.min(
+          HEAL_STOCK_TARGET - healConsumableQty(this._inventory()),
+          ...x.recipe.inputs.map((it) => Math.floor((inv.get(it.id) || 0) / (it.qty || 1))),
+        );
+        return { ...x, times };
+      })
+      .filter((x) => x.times > 0)
+      .sort((a, b) => a.recipe.levelReq - b.recipe.levelReq || a.heal.cost - b.heal.cost);
+    const pick = picks[0];
+    return pick ? { output: pick.heal.id, recipe: pick.recipe, times: Math.max(1, Math.min(3, pick.times)) } : null;
   }
 
   _healToUse() {

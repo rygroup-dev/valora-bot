@@ -7,6 +7,25 @@ const QUEST_PREFIXES = ['quest_'];
 // from consumables (mostly bread / cooked food). Broker buy price is the item
 // sell value multiplied by the vendor markup (4x in the live bundle).
 export const HEAL_CONSUMABLES = [
+  { id: 'dish_minnow', heal: 15, cost: 20 },
+  { id: 'dish_gudgeon', heal: 18, cost: 28 },
+  { id: 'dish_roach', heal: 25, cost: 44 },
+  { id: 'dish_trout', heal: 38, cost: 64 },
+  { id: 'dish_tench', heal: 59, cost: 124 },
+  { id: 'dish_perch', heal: 54, cost: 100 },
+  { id: 'dish_pike', heal: 69, cost: 128 },
+  { id: 'dish_zander', heal: 85, cost: 172 },
+  { id: 'dish_chub', heal: 80, cost: 180 },
+  { id: 'dish_carp', heal: 98, cost: 232 },
+  { id: 'dish_eel', heal: 111, cost: 272 },
+  { id: 'dish_mackerel', heal: 116, cost: 188 },
+  { id: 'dish_catfish', heal: 126, cost: 332 },
+  { id: 'dish_seabass', heal: 137, cost: 376 },
+  { id: 'dish_bream', heal: 152, cost: 432 },
+  { id: 'dish_tuna', heal: 173, cost: 632 },
+  { id: 'dish_ray', heal: 189, cost: 720 },
+  { id: 'dish_swordfish', heal: 204, cost: 1008 },
+  { id: 'dish_golden', heal: 150, cost: 560 },
   { id: 'bread_country', heal: 20, cost: 48 },
   { id: 'bread_barley', heal: 40, cost: 104 },
   { id: 'dish_boar_roast', heal: 55, cost: 96 },
@@ -50,7 +69,7 @@ export function healConsumableToBuy({ gold = 0, inventory = [], targetQty = 6, r
   const budget = gold - reserveGold;
   if (budget <= 0) return null;
   return HEAL_CONSUMABLES
-    .filter((h) => h.cost <= budget && !blocked.has(h.id))
+    .filter((h) => h.buyable === true && h.cost <= budget && !blocked.has(h.id))
     .sort((a, b) => {
       const aValue = a.heal / Math.max(1, a.cost);
       const bValue = b.heal / Math.max(1, b.cost);

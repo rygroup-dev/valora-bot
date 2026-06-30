@@ -29,6 +29,9 @@ export class RoomClient {
     this._intentionalLeave = false;
     this.lastCloseCode = null;
     this._gateWaiters = new Map();
+    this.lastMessageAt = 0;
+    this.lastJoinAt = 0;
+    this._reconnecting = false;
   }
 
   get connected() {
@@ -37,8 +40,13 @@ export class RoomClient {
 
   on(type, fn) {
     this._handlers.set(type, fn);
-    if (this.room) this.room.onMessage(type, fn);
+    if (this.room) this.room.onMessage(type, (m) => this._handleMessage(fn, m));
     return this;
+  }
+
+  _handleMessage(fn, message) {
+    this.lastMessageAt = Date.now();
+    return fn(message);
   }
 
   async connect() {
@@ -70,10 +78,13 @@ export class RoomClient {
     if (!room) throw lastErr || new Error('no joinable shard');
     this.room = room;
     this._attempt = 0;
+    this._reconnecting = false;
     this.lastCloseCode = null;
+    this.lastJoinAt = Date.now();
+    this.lastMessageAt = this.lastJoinAt;
 
     // (re)attach all registered handlers
-    for (const [type, fn] of this._handlers) room.onMessage(type, fn);
+    for (const [type, fn] of this._handlers) room.onMessage(type, (m) => this._handleMessage(fn, m));
     // Zone-gate replies (gate_check → gate_result), keyed by map.
     room.onMessage('gate_result', (s) => {
       const w = this._gateWaiters.get(s?.map);
@@ -83,7 +94,10 @@ export class RoomClient {
       }
     });
     // Wildcard: observe every message (catches unknown transition/portal msgs).
-    if (this.onAnyCb) room.onMessage('*', (type, message) => this.onAnyCb(type, message));
+    if (this.onAnyCb) room.onMessage('*', (type, message) => {
+      this.lastMessageAt = Date.now();
+      this.onAnyCb(type, message);
+    });
 
     room.onLeave((code) => {
       this.lastCloseCode = code;
@@ -108,16 +122,49 @@ export class RoomClient {
   }
 
   async _scheduleReconnect() {
+    if (this._reconnecting) return;
+    this._reconnecting = true;
     const delay = backoff(this._attempt++, { base: 2000, cap: 60000, jitterRatio: 0.3 });
     this.log(`[room] reconnecting in ${Math.round(delay)}ms (attempt ${this._attempt})`);
     await sleep(delay);
-    if (this._intentionalLeave) return;
+    if (this._intentionalLeave) {
+      this._reconnecting = false;
+      return;
+    }
     try {
       await this.connect();
       this.onRejoinCb?.(this.shardId);
     } catch (e) {
+      this._reconnecting = false;
       this.log(`[room] reconnect failed: ${e?.message}`);
       this._scheduleReconnect();
+    }
+  }
+
+  async refresh(reason = 'manual') {
+    if (this._reconnecting) return false;
+    this._reconnecting = true;
+    this.log(`[room] refreshing connection (${reason})`);
+    this._intentionalLeave = true;
+    const old = this.room;
+    this.room = null;
+    if (old) {
+      try {
+        await old.leave();
+      } catch {
+        /* ignore */
+      }
+    }
+    this._intentionalLeave = false;
+    try {
+      await this.connect();
+      this.onRejoinCb?.(this.shardId);
+      return true;
+    } catch (e) {
+      this._reconnecting = false;
+      this.log(`[room] refresh failed: ${e?.message}`);
+      this._scheduleReconnect();
+      return false;
     }
   }
 

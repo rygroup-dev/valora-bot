@@ -13,6 +13,7 @@ class NativeTelegramBot {
     this.handlers = new Map();
     this.offset = 0;
     this.polling = false;
+    this.lastPollAt = 0;
     if (polling) this.startPolling();
   }
 
@@ -22,16 +23,28 @@ class NativeTelegramBot {
     return this;
   }
 
-  async _api(method, body = {}) {
-    const res = await fetch(`${this.base}/${method}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+  async _api(method, body = {}, { timeoutMs = 45000 } = {}) {
+    // Hard timeout so a stalled connection can never wedge the poll loop
+    // (the #1 cause of "Telegram stopped responding").
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    let res;
+    try {
+      res = await fetch(`${this.base}/${method}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
     const json = await res.json().catch(() => ({}));
     if (!res.ok || json.ok === false) {
-      const msg = json.description || `${method} failed (${res.status})`;
-      throw new Error(msg);
+      const err = new Error(json.description || `${method} failed (${res.status})`);
+      err.statusCode = res.status;
+      err.retryAfter = json.parameters?.retry_after;
+      throw err;
     }
     return json.result;
   }
@@ -63,21 +76,30 @@ class NativeTelegramBot {
   }
 
   async _pollLoop() {
+    let fails = 0;
     while (this.polling) {
       try {
-        const updates = await this._api('getUpdates', {
-          offset: this.offset,
-          timeout: 30,
-          allowed_updates: ['message', 'callback_query'],
-        });
+        // long-poll 30s + 45s client timeout (always > server timeout).
+        const updates = await this._api(
+          'getUpdates',
+          { offset: this.offset, timeout: 30, allowed_updates: ['message', 'callback_query'] },
+          { timeoutMs: 45000 },
+        );
+        fails = 0;
+        this.lastPollAt = Date.now();
         for (const u of updates || []) {
           this.offset = Math.max(this.offset, u.update_id + 1);
           if (u.message) this._emit('message', u.message);
           if (u.callback_query) this._emit('callback_query', u.callback_query);
         }
       } catch (e) {
-        this.log(`[telegram] polling error: ${e?.message || e}`);
-        await new Promise((r) => setTimeout(r, 5000));
+        fails += 1;
+        // Respect Telegram flood control; otherwise exponential backoff capped at 30s.
+        const wait = e?.retryAfter
+          ? (e.retryAfter + 1) * 1000
+          : Math.min(30000, 1000 * 2 ** Math.min(fails, 5));
+        this.log(`[telegram] poll error #${fails} (${e?.message || e}) — retry in ${Math.round(wait / 1000)}s`);
+        await new Promise((r) => setTimeout(r, wait));
       }
     }
   }
@@ -104,10 +126,12 @@ export class Bot {
     this.log = log;
     this.confirms = new ConfirmRegistry();
     this.api = new PublicApi({ base });
-    this.tg = token ? new NativeTelegramBot(token, { polling: true, log }) : null;
+    this.tg = token ? new NativeTelegramBot(token, { polling: false, log }) : null;
     if (this.tg) {
+      // Wire handlers before polling to avoid dropping early updates during boot.
       this._wire();
       this._setCommands();
+      this.tg.startPolling();
     }
   }
 
@@ -117,6 +141,7 @@ export class Bot {
       { command: 'status', description: '📊 Agent status' },
       { command: 'go', description: '▶️ Start farming' },
       { command: 'stop', description: '🛑 Kill-switch' },
+      { command: 'health', description: '🩺 Bot health check' },
       { command: 'balance', description: '💰 Gold & wallet' },
       { command: 'token', description: '🪙 $VALORA info & how to get it' },
       { command: 'bridge', description: '🌉 Gold ↔ $VALORA bridge status' },
@@ -162,10 +187,15 @@ export class Bot {
       }
       const parts = (q.data || '').split(':');
       const kind = parts[0];
+      // Ack immediately so the button never shows the spinning "loading" state,
+      // then run the action — surfacing any error instead of swallowing it.
+      this.tg.answerCallbackQuery(q.id).catch(() => {});
       if (kind === 'ok') this.confirms.approve(parts[1]);
       else if (kind === 'no') this.confirms.decline(parts[1]);
-      else if (kind === 'cmd') this._run(chatId, parts[1], parts[2], q.message?.message_id).catch(() => {});
-      this.tg.answerCallbackQuery(q.id).catch(() => {});
+      else if (kind === 'cmd') {
+        this._run(chatId, parts[1], parts[2], q.message?.message_id)
+          .catch((e) => this.send(chatId, `⚠️ ${parts[1]} failed: ${e?.message || e}`));
+      }
     });
   }
 
@@ -197,6 +227,21 @@ export class Bot {
             .catch(() => this.tg.sendMessage(chatId, text, opts).catch(() => {}));
         }
         return this.tg.sendMessage(chatId, text, opts).catch(() => {});
+      }
+      case 'health': {
+        const now = Date.now();
+        const pollAge = this.tg?.lastPollAt ? Math.round((now - this.tg.lastPollAt) / 1000) : null;
+        const lines = [
+          '🩺 *Bot health*',
+          `telegram: ${this.tg ? `poll age ${pollAge ?? '?'}s` : 'disabled'}`,
+          ...[...this.agents.values()].map((a) => {
+            const s = a.statusData();
+            const room = a.room;
+            const msgAge = room?.lastMessageAt ? Math.round((now - room.lastMessageAt) / 1000) : null;
+            return `${s.connected ? '🟢' : '⚪'} *${s.label}* ${s.running ? 'running' : 'stopped'} · ${s.activity || 'idle'} · room msg ${msgAge ?? '?'}s`;
+          }),
+        ];
+        return this.send(chatId, lines.join('\n'));
       }
       case 'go':
         agents.forEach((a) => {

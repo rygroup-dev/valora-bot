@@ -58,9 +58,9 @@ describe('toolToBuy', () => {
 });
 
 describe('healConsumableToBuy', () => {
-  it('buys efficient HP food when stock is low and gold is available', () => {
+  it('does not broker-buy HP food because live consumables are crafted or looted', () => {
     const pick = healConsumableToBuy({ gold: 500, inventory: [], targetQty: 3, reserveGold: 100 });
-    expect(pick?.id).toBe('dish_wolf_stew');
+    expect(pick).toBeNull();
   });
 
   it('does not buy HP food when target stock is already reserved', () => {
@@ -73,7 +73,7 @@ describe('healConsumableToBuy', () => {
     expect(pick).toBeNull();
   });
 
-  it('skips blocked heal foods after the broker rejects them', () => {
+  it('still returns null after broker rejects known heal foods', () => {
     const pick = healConsumableToBuy({
       gold: 500,
       inventory: [],
@@ -81,6 +81,6 @@ describe('healConsumableToBuy', () => {
       reserveGold: 100,
       blocked: new Set(['dish_wolf_stew']),
     });
-    expect(pick?.id).toBe('dish_boar_roast');
+    expect(pick).toBeNull();
   });
 });
