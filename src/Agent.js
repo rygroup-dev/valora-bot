@@ -449,6 +449,7 @@ export class Agent {
     const snap = this.room ? snapshot(this.room.state, this.room.room?.sessionId) : { self: null, mobs: [], nodes: [] };
     const p = this.character?.save?.player || {};
     const self = snap.self || {};
+    const liveLevel = self.level ?? p.level ?? 1;
     if (self.cell != null) this.heroCell = self.cell; // keep our position fresh
     const canGather = !!this.mapData && this.mapData.spots(this._effectiveKinds()).length > 0;
     return {
@@ -459,7 +460,7 @@ export class Agent {
         // rest timer elapses we assume full. Before any fight, assume healthy.
         hp: this._maxHp ? (this._hp ?? this._maxHp) : 50,
         maxHp: this._maxHp || 50,
-        level: p.level ?? self.level ?? 1,
+        level: liveLevel,
         statPoints: this.character?.save?.player?.charac?.points ?? 0,
         podsUsed: (p.inventory || []).length,
         podsMax: p.podsMax ?? 100,
@@ -469,7 +470,7 @@ export class Agent {
           inventory: p.inventory || [],
           equipped: p.equipped || {},
           weights: GEAR_WEIGHTS,
-          level: p.level ?? 1,
+          level: liveLevel,
         }).length > 0,
       // Only "actionable" when a concrete quest step is available — otherwise the
       // Brain would pick a no-op 'quest' (all remaining blocked) and starve gather.
@@ -486,7 +487,7 @@ export class Agent {
                 enabled: this.combatEnabled,
                 cooldownUntil: this._combatCooldownUntil || 0,
                 mobs: snap.mobs || [],
-                self: { level: p.level ?? 1, cell: this.heroCell },
+                self: { level: liveLevel, cell: this.heroCell },
                 maxLevelDelta: this.combatDelta ?? 2,
               })
               ? 55
@@ -1665,7 +1666,10 @@ export class Agent {
 
   statusData() {
     const p = this.character?.save?.player || {};
+    const snap = this.room ? snapshot(this.room.state, this.room.room?.sessionId) : { self: null };
+    const self = snap.self || {};
     const shardInfo = (this._shards || []).find((s) => s.id === this.shardId);
+    const quest = this._questAction();
     return {
       label: this.label,
       running: this.running,
@@ -1674,10 +1678,11 @@ export class Agent {
       shardId: shardInfo ? `${shardInfo.name}${shardInfo.minHold > 0 ? ' 👑' : ''}` : this.shardId,
       connected: !!this.room?.connected,
       activity: this.lastActivity,
-      level: p.level,
+      level: self.level ?? p.level,
       gold: p.gold,
       hp: this._hp ?? p.hp,
       maxHp: this._maxHp ?? p.maxHp,
+      quest: quest ? `${quest.questId} ${quest.type}${quest.npc ? ` ${quest.npc}` : quest.target ? ` ${quest.target}` : quest.recipe ? ` ${quest.recipe}` : ''}` : null,
       pubkey: this.wallet.publicKey,
     };
   }

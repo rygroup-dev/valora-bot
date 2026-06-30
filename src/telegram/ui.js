@@ -64,6 +64,7 @@ export function formatStatus(s) {
     const hp = formatHp(s);
     lines.push(`🧙 lvl ${s.level} · 🪙 ${fmt(s.gold ?? 0)}${hp}`);
   }
+  if (s.quest) lines.push(`📜 quest: \`${s.quest}\``);
   if (s.pubkey) lines.push(`👛 \`${s.pubkey.slice(0, 8)}…${s.pubkey.slice(-4)}\``);
   return lines.join('\n');
 }

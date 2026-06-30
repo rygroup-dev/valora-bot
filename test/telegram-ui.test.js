@@ -50,10 +50,12 @@ describe('formatStatus', () => {
       gold: 1234,
       hp: 45,
       maxHp: 50,
+      quest: 'Q005 turnin mira',
       pubkey: 'di3ekoVELU2R9gw1GoVdAzjcMGDv76iMARGF19YXNTq',
     });
     expect(txt).toContain('main');
     expect(txt).toContain('combat');
+    expect(txt).toContain('Q005 turnin mira');
     expect(txt).toContain('1,234');
     expect(txt).toContain('di3ekoVE');
     expect(txt).toMatch(/45.*50/); // hp/maxHp
