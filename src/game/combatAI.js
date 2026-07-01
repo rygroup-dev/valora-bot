@@ -15,15 +15,18 @@ export const SPELLS = {
 
 // state: { self:{cell,ap,mp,hp,maxHp}, enemies:[{id,cell,hp}], dist(a,b), stepToward(from,target,mp) }
 // dist(a,b): cell distance. stepToward(from,target,mp): best reachable cell within mp toward target (or from).
-export function planTurn(state, { healThreshold = 0.4 } = {}) {
+export function planTurn(state, { healThreshold = 0.4, fleeThreshold = 0.18, heals = [] } = {}) {
   const acts = [];
   const self = { ...state.self };
   const dist = state.dist || ((a, b) => Math.abs(a - b));
   const enemies = (state.enemies || []).filter((e) => e && e.hp > 0);
   if (!enemies.length) return [{ kind: 'endTurn' }];
 
+  const hpRatio = self.maxHp ? self.hp / self.maxHp : 1;
+  if (hpRatio <= fleeThreshold) return [{ kind: 'flee' }, { kind: 'endTurn' }];
+
   // Heal once if low and affordable.
-  if (self.maxHp && self.hp / self.maxHp <= healThreshold && self.ap >= SPELLS.mend.ap) {
+  if (self.maxHp && hpRatio <= healThreshold && self.ap >= SPELLS.mend.ap) {
     acts.push({ kind: 'cast', spellId: 'mend', cell: self.cell });
     self.ap -= SPELLS.mend.ap;
   }

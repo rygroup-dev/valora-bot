@@ -411,11 +411,12 @@ export class Agent {
           // Loss-backoff: after repeated losses, pause combat and return to safe
           // gathering/quests so the bot stops bleeding until it grows stronger.
           this._combatLossStreak = (this._combatLossStreak || 0) + 1;
+          this._restingUntil = 0;
+          this._combatCooldownUntil = Date.now() + 30 * 60 * 1000;
           if (this._combatLossStreak >= 2) {
-            this._combatCooldownUntil = Date.now() + 30 * 60 * 1000;
             this._event(`💀 fight lost (${this._combatLossStreak}×) — pausing combat 30m, back to gathering`, { notify: true });
           } else {
-            this._event('💀 fight lost', { notify: true });
+            this._event('💀 fight lost — pausing combat 30m, back to gathering', { notify: true });
           }
         }
       })
@@ -488,7 +489,7 @@ export class Agent {
                 cooldownUntil: this._combatCooldownUntil || 0,
                 mobs: snap.mobs || [],
                 self: { level: liveLevel, cell: this.heroCell },
-                maxLevelDelta: this.combatDelta ?? 2,
+                maxLevelDelta: this._combatMaxDelta(liveLevel),
               })
               ? 55
               : 0,
@@ -684,7 +685,7 @@ export class Agent {
       cooldownUntil: this._combatCooldownUntil || 0,
       mobs,
       self: { ...ctx.player, cell: this.heroCell },
-      maxLevelDelta: this.combatDelta ?? 2,
+      maxLevelDelta: this._combatMaxDelta(ctx.player?.level),
     });
     if (!target || target.gid == null) return;
 
@@ -845,8 +846,13 @@ export class Agent {
     // Wait for the current harvest to resolve before starting another (with a
     // safety timeout so a lost result never wedges the bot).
     if (this._busyHarvesting) {
-      if (Date.now() - this._harvestAt > 12000) this._busyHarvesting = false;
-      else return;
+      if (Date.now() - this._harvestAt > 12000) {
+        const stale = [...this._harvesting];
+        this._harvesting.clear();
+        for (const cell of stale) this._blockedCells.add(cell);
+        this._busyHarvesting = false;
+        this._event(`🌿 harvest stale${stale.length ? ` (${stale.join(',')})` : ''} — retrying`);
+      } else return;
     }
     if (this.walking || !this.mapData || this.heroCell == null) {
       return;
@@ -1115,7 +1121,13 @@ export class Agent {
         const need = (missing.qty || 1) * (sa.count || 1);
         const kind = RESOURCE_KIND(missing.id);
         if (kind) {
-          this._event(`📜 ${sa.questId} needs ${missing.id} ${this._invQty(missing.id)}/${need} — gathering before craft`);
+          const key = `${sa.questId}:${sa.step}:${missing.id}`;
+          const now = Date.now();
+          if (this._lastMissingQuestInputKey !== key || now - (this._lastMissingQuestInputAt || 0) > 15000) {
+            this._lastMissingQuestInputKey = key;
+            this._lastMissingQuestInputAt = now;
+            this._event(`📜 ${sa.questId} needs ${missing.id} ${this._invQty(missing.id)}/${need} — gathering before craft`);
+          }
           return this._doQuest({ type: 'gather', questId: sa.questId, step: sa.step, target: missing.id, count: need });
         }
         return this._blockQuest(sa.questId, `missing ${missing.id}`);
@@ -1584,6 +1596,14 @@ export class Agent {
 
   _needsStartupRecovery() {
     return this.combatEnabled && !this._maxHp && Date.now() < (this._startupRecoverUntil || 0);
+  }
+
+  _combatMaxDelta(level = 1) {
+    const base = this.combatDelta ?? 0;
+    // If recent fights are losing, only seek clearly easier mobs until a level-up
+    // clears the streak. This keeps combat alive without repeatedly feeding HP.
+    if ((this._combatLossStreak || 0) >= 2) return Math.min(base, -1);
+    return base;
   }
 
   _healsForFight(missingHp = Infinity) {

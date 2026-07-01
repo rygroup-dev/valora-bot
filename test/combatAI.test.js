@@ -32,6 +32,14 @@ describe('planTurn', () => {
     expect(acts.some((a) => a.kind === 'use')).toBe(false);
   });
 
+  it('flees at critical hp', () => {
+    const acts = planTurn(
+      { self: { cell: 0, ap: 6, mp: 3, hp: 5, maxHp: 50 }, enemies: [{ id: 1, cell: 4, hp: 30 }], dist, stepToward },
+      { heals: [{ id: 'bread_barley', heal: 40 }] },
+    );
+    expect(acts).toEqual([{ kind: 'flee' }, { kind: 'endTurn' }]);
+  });
+
   it('moves toward a far enemy then attacks', () => {
     // enemy at 9 (out of bolt max 6) -> move closer then bolt
     const acts = planTurn({ self: { cell: 0, ap: 6, mp: 3, hp: 50, maxHp: 50 }, enemies: [{ id: 1, cell: 9, hp: 30 }], dist, stepToward });

@@ -79,4 +79,20 @@ describe('live view and quest progress fallbacks', () => {
 
     expect(bought).toEqual({ id: 'paysan_sickle', kind: 'cereal' });
   });
+
+  it('clears stale harvest cells when the server never replies', async () => {
+    const a = makeAgent();
+    a._busyHarvesting = true;
+    a._harvestAt = Date.now() - 13000;
+    a._harvesting = new Set([518]);
+    a.walking = false;
+    a.heroCell = 1;
+    a._event = () => {};
+    a._effectiveKinds = () => [];
+
+    await a._doGather();
+
+    expect(a._busyHarvesting).toBe(false);
+    expect([...a._harvesting]).toEqual([]);
+  });
 });

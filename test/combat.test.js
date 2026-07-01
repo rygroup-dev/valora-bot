@@ -115,4 +115,13 @@ describe('Agent HP recovery gate', () => {
     agent._maxHp = 80;
     expect(agent._needsStartupRecovery()).toBe(false);
   });
+
+  it('seeks easier mobs after repeated losses', () => {
+    const agent = Object.assign(Object.create(Agent.prototype), {
+      combatDelta: 0,
+      _combatLossStreak: 2,
+    });
+
+    expect(agent._combatMaxDelta(4)).toBe(-1);
+  });
 });
