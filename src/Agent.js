@@ -56,6 +56,13 @@ const HOME_MAP = 'city'; // broker/HDV/most quest givers live here
 const ROOM_STALE_MS = 8 * 60 * 1000;
 // Armor pieces that occupy their own slots (equip once, permanent).
 const ARMOR_ITEMS = ['oak_shield', 'travel_cape', 'enchanted_hat'];
+const BROKER_GEAR = [
+  { id: 'oak_shield', cost: 120 },
+  { id: COMBAT_WEAPON, cost: 150 },
+  { id: 'travel_cape', cost: 100 },
+  { id: 'enchanted_hat', cost: 100 },
+];
+const COMBAT_REQUIRED_GEAR = [COMBAT_WEAPON, ...ARMOR_ITEMS];
 
 const STAT_BUILD = { vitalite: 0.4, force: 0.4, adresse: 0.2 };
 const GEAR_WEIGHTS = { dmg: 2, pv: 1, force: 1.5, crit: 3, adresse: 1, pa: 5, pm: 4 };
@@ -71,6 +78,8 @@ export class Agent {
     this.config = config;
     this.bot = bot;
     this.log = (m) => log(`[${this.label}] ${m}`);
+    this.store = store;
+    this._combatCooldownKey = `valora:combatCooldown:v1:${wallet.publicKey}`;
 
     this.rest = new RestClient({ base: config.base });
     this.auth = new Auth({ rest: this.rest, wallet, store, log: this.log });
@@ -111,6 +120,7 @@ export class Agent {
     this.combatDelta = 0;
     this._startupRecoverUntil = Date.now() + HP_REST_WINDOW_MS;
     this._hpTrusted = false;
+    this._restoreCombatCooldown();
     // Cross-map travel: gate_check → walk to portal → await-leave + re-join the
     // destination room (the anti-teleport-safe flow the live client uses). Live-
     // verified round-trip city↔mine1 with ore gathering, so it's enabled.
@@ -291,6 +301,19 @@ export class Agent {
           this._lastHealBuy = null;
         }
         if (m?.op === 'buy' && m.ok !== false && this._lastHealBuy) this._lastHealBuy = null;
+        if (m?.op === 'buy' && this._lastGearBuy) {
+          const gear = this._lastGearBuy;
+          if (m.ok === false) {
+            if (!this._gearBuyBlocked) this._gearBuyBlocked = new Set();
+            this._gearBuyBlocked.add(gear.id);
+            this._event(`gear buy failed: ${gear.id} (${m.error || 'unknown'}), blocking until restart/level change`);
+          } else {
+            this._boughtGear.add(gear.id);
+            this._pendingEquip = gear.id;
+            this._event(`🛡 bought gear ${gear.id} — equipping next`);
+          }
+          this._lastGearBuy = null;
+        }
         // Track items we can't equip yet (level-gated) so we stop retrying.
         if (m?.op === 'equip' && m?.error === 'level_req') {
           if (!this._levelBlocked) this._levelBlocked = new Set();
@@ -410,8 +433,7 @@ export class Agent {
         this._applyView(m?.view);
         if (won) {
           this._fightsWon = (this._fightsWon || 0) + 1;
-          this._combatLossStreak = 0;
-          this._combatLowHpLockUntil = 0;
+          this._clearCombatCooldown();
           this._event(`⚔️ fight won${m?.xp ? ` +${m.xp}xp` : ''} [#${this._fightsWon || 0}]`, { notify: true });
         } else {
           // Loss-backoff: after repeated losses, pause combat and return to safe
@@ -422,6 +444,7 @@ export class Agent {
           const startedDangerouslyLow = start?.maxHp && start.hp / start.maxHp <= 0.2;
           this._combatCooldownUntil = Date.now() + (startedDangerouslyLow ? COMBAT_LOW_HP_LOCK_MS : 60 * 60 * 1000);
           if (startedDangerouslyLow) this._combatLowHpLockUntil = this._combatCooldownUntil;
+          this._saveCombatCooldown(startedDangerouslyLow ? 'low_hp_loss' : 'loss');
           if (this._combatLossStreak >= 2) {
             this._event(`💀 fight lost (${this._combatLossStreak}×) — pausing combat ${startedDangerouslyLow ? '2h (low HP engage)' : '60m'}, back to gathering`, { notify: true });
           } else {
@@ -463,6 +486,7 @@ export class Agent {
     const liveLevel = self.level ?? p.level ?? 1;
     if (self.cell != null) this.heroCell = self.cell; // keep our position fresh
     const canGather = !!this.mapData && this.mapData.spots(this._effectiveKinds()).length > 0;
+    const combatWindow = this._combatTargetWindow(liveLevel);
     return {
       snap,
       player: {
@@ -501,7 +525,9 @@ export class Agent {
                 cooldownUntil: this._combatCooldownUntil || 0,
                 mobs: snap.mobs || [],
                 self: { level: liveLevel, cell: this.heroCell },
-                maxLevelDelta: this._combatMaxDelta(liveLevel),
+                minLevelDelta: combatWindow.minDelta,
+                maxLevelDelta: combatWindow.maxDelta,
+                prefer: 'equal',
               })
               ? 55
               : 0,
@@ -532,8 +558,7 @@ export class Agent {
     if (this._lastLevel != null && lvl > this._lastLevel) {
       this._event(`🎉 Level up! now level ${lvl}`, { notify: true });
       // Stronger now — give combat another chance (clear the loss backoff).
-      this._combatCooldownUntil = 0;
-      this._combatLossStreak = 0;
+      this._clearCombatCooldown();
     }
     if (this._lastGold != null && gold - this._lastGold >= 1000) {
       this._event(`🪙 +${(gold - this._lastGold).toLocaleString()} gold (total ${gold.toLocaleString()})`, { notify: true });
@@ -687,12 +712,15 @@ export class Agent {
     if (!this._combatReady(ctx.player?.level)) return;
     // Respect the post-loss backoff (don't bleed into unwinnable fights).
     const mobs = ctx.snap.mobs || [];
+    const combatWindow = this._combatTargetWindow(ctx.player?.level);
     const target = combatSeekTarget({
       enabled: this.combatEnabled,
       cooldownUntil: this._combatCooldownUntil || 0,
       mobs,
       self: { ...ctx.player, cell: this.heroCell },
-      maxLevelDelta: this._combatMaxDelta(ctx.player?.level),
+      minLevelDelta: combatWindow.minDelta,
+      maxLevelDelta: combatWindow.maxDelta,
+      prefer: 'equal',
     });
     if (!target || target.gid == null) return;
 
@@ -710,12 +738,15 @@ export class Agent {
         }
       }
     }
-    // Prefer a real weapon if we can equip it, but never block the fight on it
-    // (broker gear is level-gated; a gathering tool still does base damage).
+    // Equip the real weapon first and wait for the equip result before engage.
+    // This avoids starting an equal-level trainer fight with a gathering tool.
     if (this._weaponEquipped() !== COMBAT_WEAPON && this._invHas(COMBAT_WEAPON) && !this._swordBlocked) {
       this._guardedSend('econ_equip', { id: COMBAT_WEAPON });
+      this._pendingEquip = COMBAT_WEAPON;
+      this._event(`🔧 equipping ${COMBAT_WEAPON} before equal-level combat`);
+      return;
     }
-    this._event(`⚔️ engaging ${target.mobId} (lvl ${target.level})`);
+    this._event(`⚔️ engaging ${target.mobId} (lvl ${target.level}, equal trainer)`);
     this.inFight = true;
     this._placed = false;
     this._fightStartHp = null;
@@ -977,8 +1008,7 @@ export class Agent {
     const afterXp = after.xp ?? after.exp ?? after.experience ?? null;
     if (beforeLevel != null && after.level > beforeLevel) {
       this._event(`🎉 Level up! now level ${after.level}`, { notify: true });
-      this._combatCooldownUntil = 0;
-      this._combatLossStreak = 0;
+      this._clearCombatCooldown();
     } else if (beforeXp != null && afterXp != null && afterXp !== beforeXp) {
       this._event(`🧙 character XP ${beforeXp}→${afterXp} (lvl ${after.level || '?'})`);
     }
@@ -1628,9 +1658,9 @@ export class Agent {
     if (!(await this._ensureHome())) return;
     if (!(await this._gotoNpc(BROKER_NPC))) return;
     this._event(`🛡 buying gear ${gear.id} for ~${gear.cost}g`, { notify: true });
+    this._lastGearBuy = gear;
+    this._lastGearBuyAt = Date.now();
     this._guardedSend('econ_buy', { cart: [{ id: gear.id, qty: 1 }] });
-    this._boughtGear.add(gear.id);
-    this._pendingEquip = gear.id;
   }
 
   _healToBuy() {
@@ -1701,16 +1731,57 @@ export class Agent {
     // (fight snapshot or successful heal-to-ready) before risking another fight.
     if (this._isMainApex() && this._maxHp && !this._hpTrusted) return false;
     if (this._pendingEquip && ['iron_sword', ...ARMOR_ITEMS].includes(this._pendingEquip)) return false;
+    if (!this._combatGearReady(level)) return false;
     return true;
   }
 
-  _combatMaxDelta(level = 1) {
-    const base = this.combatDelta ?? 0;
-    // If recent fights are losing, only seek clearly easier mobs until a level-up
-    // clears the streak. This keeps combat alive without repeatedly feeding HP.
-    if ((this._combatLossStreak || 0) >= 2) return Math.min(base, -2);
-    if ((this._combatLossStreak || 0) >= 1) return Math.min(base, -1);
-    return base;
+  _combatTargetWindow(level = 1) {
+    // Trainer mode: fight mobs at exactly our character level. After losses,
+    // cooldown handles recovery instead of silently switching to unrelated mobs.
+    return { minDelta: 0, maxDelta: 0 };
+  }
+
+  _hasCombatItem(id) {
+    if (!id) return false;
+    if (this._invHas(id)) return true;
+    return Object.values(this._equipped()).some((v) => (typeof v === 'string' ? v : v?.id || v?.item) === id);
+  }
+
+  _combatGearReady(level = 1) {
+    if (level < 3) return true;
+    if (this._lastGearBuy) return false;
+    if (!this._boughtGear) this._boughtGear = new Set();
+    const blocked = this._levelBlocked || new Set();
+    const unavailable = this._gearBuyBlocked || new Set();
+    return COMBAT_REQUIRED_GEAR.every((id) => this._hasCombatItem(id) || blocked.has(id) || unavailable.has(id));
+  }
+
+  _restoreCombatCooldown() {
+    const saved = this.store?.get?.(this._combatCooldownKey);
+    if (!saved || typeof saved !== 'object') return;
+    const until = Number(saved.until || 0);
+    if (!Number.isFinite(until) || until <= Date.now()) return;
+    this._combatCooldownUntil = until;
+    this._combatLowHpLockUntil = Number(saved.lowHpUntil || 0);
+    this._combatLossStreak = Number(saved.lossStreak || 0);
+  }
+
+  _saveCombatCooldown(reason = 'loss') {
+    if (!this._combatCooldownUntil || this._combatCooldownUntil <= Date.now()) return;
+    this.store?.set?.(this._combatCooldownKey, {
+      until: this._combatCooldownUntil,
+      lowHpUntil: this._combatLowHpLockUntil || 0,
+      lossStreak: this._combatLossStreak || 0,
+      reason,
+      savedAt: Date.now(),
+    });
+  }
+
+  _clearCombatCooldown() {
+    this._combatCooldownUntil = 0;
+    this._combatLowHpLockUntil = 0;
+    this._combatLossStreak = 0;
+    this.store?.del?.(this._combatCooldownKey);
   }
 
   _healsForFight(missingHp = Infinity) {
@@ -1739,22 +1810,18 @@ export class Agent {
   // Basic broker armor/gear to make the character stronger (bought once each).
   _gearToBuy() {
     if (!this._boughtGear) this._boughtGear = new Set();
+    if (this._lastGearBuy && Date.now() - (this._lastGearBuyAt || 0) < 10000) return null;
     // Most broker gear is level-gated; don't waste gold until the character has
     // leveled up via combat enough to equip it.
     if ((this.character?.save?.player?.level || 1) < 3) return null;
     const gold = this._gold();
+    const blocked = this._gearBuyBlocked || new Set();
     const have = (id) =>
       this._inventory().some((it) => (it.id || it) === id) ||
       Object.values(this._equipped()).some((v) => (v?.id || v) === id) ||
       this._boughtGear.has(id);
-    const GEAR = [
-      { id: 'oak_shield', cost: 120 },
-      { id: 'iron_sword', cost: 150 },
-      { id: 'travel_cape', cost: 100 },
-      { id: 'enchanted_hat', cost: 100 },
-    ];
     // Keep a gold buffer so we can still buy tools.
-    for (const g of GEAR) if (!have(g.id) && gold >= g.cost + 100) return g;
+    for (const g of BROKER_GEAR) if (!blocked.has(g.id) && !have(g.id) && gold >= g.cost + 100) return g;
     return null;
   }
 

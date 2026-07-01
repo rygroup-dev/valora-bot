@@ -57,6 +57,22 @@ describe('combatSeekTarget', () => {
     const hard = [{ id: 'boss', gid: 9, level: 40, cell: 101 }];
     expect(combatSeekTarget({ enabled: true, mobs: hard, self, maxLevelDelta: 2 })).toBeNull();
   });
+  it('can be constrained to equal-level trainer targets only', () => {
+    const mixed = [
+      { id: 'low', gid: 1, level: 4, cell: 101, hp: 30 },
+      { id: 'equal', gid: 2, level: 5, cell: 140, hp: 30 },
+      { id: 'high', gid: 3, level: 6, cell: 102, hp: 30 },
+    ];
+    const t = combatSeekTarget({
+      enabled: true,
+      mobs: mixed,
+      self,
+      minLevelDelta: 0,
+      maxLevelDelta: 0,
+      prefer: 'equal',
+    });
+    expect(t?.id).toBe('equal');
+  });
 });
 
 describe('decideFightAction', () => {
@@ -116,16 +132,13 @@ describe('Agent HP recovery gate', () => {
     expect(agent._needsStartupRecovery()).toBe(false);
   });
 
-  it('seeks easier mobs after repeated losses', () => {
+  it('keeps trainer combat constrained to equal-level mobs', () => {
     const agent = Object.assign(Object.create(Agent.prototype), {
       combatDelta: 0,
       _combatLossStreak: 1,
     });
 
-    expect(agent._combatMaxDelta(4)).toBe(-1);
-
-    agent._combatLossStreak = 2;
-    expect(agent._combatMaxDelta(4)).toBe(-2);
+    expect(agent._combatTargetWindow(4)).toEqual({ minDelta: 0, maxDelta: 0 });
   });
 
   it('blocks main Apex combat when HP is only timer-assumed', () => {
@@ -138,6 +151,8 @@ describe('Agent HP recovery gate', () => {
       _hpTrusted: false,
       _startupRecoverUntil: 0,
       _combatCooldownUntil: 0,
+      _inventory: () => [{ id: 'iron_sword' }, { id: 'oak_shield' }, { id: 'travel_cape' }, { id: 'enchanted_hat' }],
+      _equipped: () => ({}),
     });
 
     expect(agent._combatReady(4)).toBe(false);
@@ -155,8 +170,29 @@ describe('Agent HP recovery gate', () => {
       _hpTrusted: false,
       _startupRecoverUntil: 0,
       _combatCooldownUntil: 0,
+      _inventory: () => [{ id: 'iron_sword' }, { id: 'oak_shield' }, { id: 'travel_cape' }, { id: 'enchanted_hat' }],
+      _equipped: () => ({}),
     });
 
+    expect(agent._combatReady(4)).toBe(true);
+  });
+
+  it('blocks trainer combat until required gear is owned or confirmed unavailable', () => {
+    const agent = Object.assign(Object.create(Agent.prototype), {
+      label: 'sub8',
+      shardId: '1',
+      combatEnabled: true,
+      _maxHp: 80,
+      _hp: 80,
+      _hpTrusted: true,
+      _startupRecoverUntil: 0,
+      _combatCooldownUntil: 0,
+      _inventory: () => [{ id: 'iron_sword' }],
+      _equipped: () => ({}),
+    });
+
+    expect(agent._combatReady(4)).toBe(false);
+    agent._gearBuyBlocked = new Set(['oak_shield', 'iron_sword', 'travel_cape', 'enchanted_hat']);
     expect(agent._combatReady(4)).toBe(true);
   });
 });
