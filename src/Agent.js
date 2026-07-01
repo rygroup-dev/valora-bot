@@ -1102,10 +1102,25 @@ export class Agent {
       if (await this._travelTo(HOME_MAP)) return;
     }
     if (sa.type === 'craft') {
-      if (!this._bumpStepTries(sa, 6)) return this._blockQuest(sa.questId, 'craft failed');
       // Quest target is the OUTPUT item; econ_craft needs the recipe id + station.
       const rec = RECIPE_MAP[sa.recipe];
       if (!rec) return this._blockQuest(sa.questId, `no recipe for ${sa.recipe}`);
+      if (this._invQty(sa.recipe) >= (sa.count || 1)) {
+        this._advanceQuestFloor(sa.questId, sa.step + 1);
+        this._event(`📜 ${sa.questId} inventory ${sa.recipe} ${this._invQty(sa.recipe)}/${sa.count || 1} — next step`);
+        return;
+      }
+      const missing = (rec.inputs || []).find((it) => this._invQty(it.id) < (it.qty || 1) * (sa.count || 1));
+      if (missing) {
+        const need = (missing.qty || 1) * (sa.count || 1);
+        const kind = RESOURCE_KIND(missing.id);
+        if (kind) {
+          this._event(`📜 ${sa.questId} needs ${missing.id} ${this._invQty(missing.id)}/${need} — gathering before craft`);
+          return this._doQuest({ type: 'gather', questId: sa.questId, step: sa.step, target: missing.id, count: need });
+        }
+        return this._blockQuest(sa.questId, `missing ${missing.id}`);
+      }
+      if (!this._bumpStepTries(sa, 6)) return this._blockQuest(sa.questId, 'craft failed');
       if ((rec.levelReq || 1) > 1 && !this._craftJobLevelOk(rec)) {
         return this._blockQuest(sa.questId, `${rec.kind} lvl ${rec.levelReq} needed`);
       }
