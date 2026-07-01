@@ -119,9 +119,44 @@ describe('Agent HP recovery gate', () => {
   it('seeks easier mobs after repeated losses', () => {
     const agent = Object.assign(Object.create(Agent.prototype), {
       combatDelta: 0,
-      _combatLossStreak: 2,
+      _combatLossStreak: 1,
     });
 
     expect(agent._combatMaxDelta(4)).toBe(-1);
+
+    agent._combatLossStreak = 2;
+    expect(agent._combatMaxDelta(4)).toBe(-2);
+  });
+
+  it('blocks main Apex combat when HP is only timer-assumed', () => {
+    const agent = Object.assign(Object.create(Agent.prototype), {
+      label: 'main',
+      shardId: 'apex',
+      combatEnabled: true,
+      _maxHp: 80,
+      _hp: 80,
+      _hpTrusted: false,
+      _startupRecoverUntil: 0,
+      _combatCooldownUntil: 0,
+    });
+
+    expect(agent._combatReady(4)).toBe(false);
+    agent._hpTrusted = true;
+    expect(agent._combatReady(4)).toBe(true);
+  });
+
+  it('allows non-Apex combat with timer-assumed HP after recovery', () => {
+    const agent = Object.assign(Object.create(Agent.prototype), {
+      label: 'sub8',
+      shardId: '1',
+      combatEnabled: true,
+      _maxHp: 80,
+      _hp: 80,
+      _hpTrusted: false,
+      _startupRecoverUntil: 0,
+      _combatCooldownUntil: 0,
+    });
+
+    expect(agent._combatReady(4)).toBe(true);
   });
 });

@@ -43,6 +43,7 @@ const HEAL_STOCK_TARGET = 8;
 const HEAL_BUY_RESERVE_GOLD = 120;
 const HP_READY_RATIO = 0.95;
 const HP_REST_WINDOW_MS = 5 * 60 * 1000;
+const COMBAT_LOW_HP_LOCK_MS = 2 * 60 * 60 * 1000;
 // Which resource each tool can harvest.
 const TOOL_KIND = { bucheron_axe: 'wood', fishing_rod: 'fish', mining_pick: 'mineral', paysan_sickle: 'cereal' };
 const KIND_TOOL = { wood: 'bucheron_axe', fish: 'fishing_rod', mineral: 'mining_pick', cereal: 'paysan_sickle' };
@@ -107,6 +108,7 @@ export class Agent {
     this.combatEnabled = true;
     this.combatDelta = 0;
     this._startupRecoverUntil = Date.now() + HP_REST_WINDOW_MS;
+    this._hpTrusted = false;
     // Cross-map travel: gate_check → walk to portal → await-leave + re-join the
     // destination room (the anti-teleport-safe flow the live client uses). Live-
     // verified round-trip city↔mine1 with ore gathering, so it's enabled.
@@ -271,6 +273,7 @@ export class Agent {
           const heal = this._lastHealUse;
           const before = this._hp;
           if (this._maxHp && typeof this._hp === 'number') this._hp = Math.min(this._maxHp, this._hp + heal.heal);
+          if (this._maxHp && typeof this._hp === 'number' && this._hp / this._maxHp >= HP_READY_RATIO) this._hpTrusted = true;
           this._event(`🍞 used ${heal.id} (+${heal.heal} HP${before == null ? '' : `, ${before}->${this._hp ?? '?'}`})`);
           this._lastHealUse = null;
           this._restingUntil = 0;
@@ -406,19 +409,24 @@ export class Agent {
         if (won) {
           this._fightsWon = (this._fightsWon || 0) + 1;
           this._combatLossStreak = 0;
+          this._combatLowHpLockUntil = 0;
           this._event(`⚔️ fight won${m?.xp ? ` +${m.xp}xp` : ''} [#${this._fightsWon || 0}]`, { notify: true });
         } else {
           // Loss-backoff: after repeated losses, pause combat and return to safe
           // gathering/quests so the bot stops bleeding until it grows stronger.
           this._combatLossStreak = (this._combatLossStreak || 0) + 1;
           this._restingUntil = 0;
-          this._combatCooldownUntil = Date.now() + 30 * 60 * 1000;
+          const start = this._fightStartHp;
+          const startedDangerouslyLow = start?.maxHp && start.hp / start.maxHp <= 0.2;
+          this._combatCooldownUntil = Date.now() + (startedDangerouslyLow ? COMBAT_LOW_HP_LOCK_MS : 60 * 60 * 1000);
+          if (startedDangerouslyLow) this._combatLowHpLockUntil = this._combatCooldownUntil;
           if (this._combatLossStreak >= 2) {
-            this._event(`💀 fight lost (${this._combatLossStreak}×) — pausing combat 30m, back to gathering`, { notify: true });
+            this._event(`💀 fight lost (${this._combatLossStreak}×) — pausing combat ${startedDangerouslyLow ? '2h (low HP engage)' : '60m'}, back to gathering`, { notify: true });
           } else {
-            this._event('💀 fight lost — pausing combat 30m, back to gathering', { notify: true });
+            this._event(`💀 fight lost — pausing combat ${startedDangerouslyLow ? '2h (low HP engage)' : '60m'}, back to gathering`, { notify: true });
           }
         }
+        this._fightStartHp = null;
       })
       .on('fight_denied', () => this.safety.recordDenied('engageFight'))
       .on('fight', (m) => this._onFight(m))
@@ -481,8 +489,7 @@ export class Agent {
         // Value combat only when a winnable fight is available, we're not in a
         // post-loss backoff, and the last observed fight HP is ready.
         combatValue:
-          this._needsHpRecovery()
-            || this._needsStartupRecovery()
+          !this._combatReady(liveLevel)
             ? 0
             : combatSeekTarget({
                 enabled: this.combatEnabled,
@@ -669,6 +676,7 @@ export class Agent {
     }
     if (now >= this._restingUntil) {
       this._hp = this._maxHp || this._hp; // assume recovered
+      this._hpTrusted = false; // timer-only recovery is not proof the server healed us
       this._restingUntil = 0;
       this._event('🟢 rested — HP assumed full, back to action');
       return;
@@ -678,6 +686,7 @@ export class Agent {
 
   async _doCombat(ctx) {
     if (!this.combatEnabled || this.inFight || this.walking) return;
+    if (!this._combatReady(ctx.player?.level)) return;
     // Respect the post-loss backoff (don't bleed into unwinnable fights).
     const mobs = ctx.snap.mobs || [];
     const target = combatSeekTarget({
@@ -711,6 +720,7 @@ export class Agent {
     this._event(`⚔️ engaging ${target.mobId} (lvl ${target.level})`);
     this.inFight = true;
     this._placed = false;
+    this._fightStartHp = null;
     this._engagedMid = target.id;
     this._guardedSend('engageFight', { gid: target.gid }); // engage uses gid, not mid
   }
@@ -746,7 +756,11 @@ export class Agent {
     // HP is only observable inside a fight — capture it so the Brain can decide
     // to rest/heal afterwards (out of combat the player schema carries no HP).
     if (typeof me.maxHp === 'number' && me.maxHp > 0) this._maxHp = me.maxHp;
-    if (typeof me.hp === 'number') this._hp = me.hp;
+    if (typeof me.hp === 'number') {
+      this._hp = me.hp;
+      this._hpTrusted = true;
+      if (!this._fightStartHp && this._maxHp) this._fightStartHp = { hp: me.hp, maxHp: this._maxHp };
+    }
 
     // Placement phase: take a start cell then ready up (once).
     if (phase === 'placement' || phase === 'place') {
@@ -1633,11 +1647,29 @@ export class Agent {
     return this.combatEnabled && !this._maxHp && Date.now() < (this._startupRecoverUntil || 0);
   }
 
+  _isMainApex() {
+    return this.label === 'main' && this.shardId === 'apex';
+  }
+
+  _combatReady(level = 1) {
+    if (!this.combatEnabled) return false;
+    if (Date.now() < (this._combatCooldownUntil || 0)) return false;
+    if (Date.now() < (this._combatLowHpLockUntil || 0)) return false;
+    if (this._needsHpRecovery() || this._needsStartupRecovery()) return false;
+    // On Apex, a timer-based rest assumption is not enough: the live server has
+    // shown main can still enter combat at 1/80 HP. Require a trusted HP source
+    // (fight snapshot or successful heal-to-ready) before risking another fight.
+    if (this._isMainApex() && this._maxHp && !this._hpTrusted) return false;
+    if (this._pendingEquip && ['iron_sword', ...ARMOR_ITEMS].includes(this._pendingEquip)) return false;
+    return true;
+  }
+
   _combatMaxDelta(level = 1) {
     const base = this.combatDelta ?? 0;
     // If recent fights are losing, only seek clearly easier mobs until a level-up
     // clears the streak. This keeps combat alive without repeatedly feeding HP.
-    if ((this._combatLossStreak || 0) >= 2) return Math.min(base, -1);
+    if ((this._combatLossStreak || 0) >= 2) return Math.min(base, -2);
+    if ((this._combatLossStreak || 0) >= 1) return Math.min(base, -1);
     return base;
   }
 
