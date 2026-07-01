@@ -47,6 +47,10 @@ describe('formatStatus', () => {
       connected: true,
       activity: 'combat',
       level: 10,
+      characterXp: 54,
+      topJobs: [{ id: 'bucheron', level: 31, xp: 1065 }],
+      prioritizingCharacterLevel: true,
+      characterLevelTarget: 12,
       gold: 1234,
       hp: 45,
       maxHp: 50,
@@ -56,6 +60,9 @@ describe('formatStatus', () => {
     expect(txt).toContain('main');
     expect(txt).toContain('combat');
     expect(txt).toContain('Q005 turnin mira');
+    expect(txt).toContain('xp 54');
+    expect(txt).toContain('bucheron 31');
+    expect(txt).toContain('leveling character');
     expect(txt).toContain('1,234');
     expect(txt).toContain('di3ekoVE');
     expect(txt).toMatch(/45.*50/); // hp/maxHp

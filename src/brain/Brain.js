@@ -6,9 +6,10 @@
 //   2. bank        — inventory pods near full
 //   3. allocate    — pending stat points (free power)
 //   4. upgrade     — gear upgrade available (free power)
-//   5. profit      — best of combat / craft / gather by value
-//   6. quest       — actionable quests
-//   7. gather      — fallback
+//   5. quest       — when character leveling is the current goal
+//   6. profit      — best of combat / craft / gather by value
+//   7. quest       — actionable quests
+//   8. gather      — fallback
 
 const HP_REST = 0.3;
 const PODS_FULL = 0.9;
@@ -22,6 +23,9 @@ export function decideActivity(ctx) {
   if (podsRatio >= PODS_FULL) return { type: 'bank', reason: `pods ${Math.round(podsRatio * 100)}%` };
   if ((p.statPoints || 0) > 0) return { type: 'allocate_stats', reason: `${p.statPoints} points` };
   if (ctx.hasGearUpgrade) return { type: 'upgrade_gear', reason: 'better gear available' };
+  if (ctx.progression?.prioritizeCharacterLevel && ctx.quests?.actionable) {
+    return { type: 'quest', reason: 'character leveling' };
+  }
 
   const profit = ctx.profit || {};
   const options = [

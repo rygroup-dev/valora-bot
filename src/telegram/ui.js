@@ -62,7 +62,17 @@ export function formatStatus(s) {
   if (s.shardId) lines.push(`🗺 shard \`${s.shardId}\` · 🎯 ${s.activity || 'idle'}`);
   if (s.level != null) {
     const hp = formatHp(s);
-    lines.push(`🧙 lvl ${s.level} · 🪙 ${fmt(s.gold ?? 0)}${hp}`);
+    const xp = s.characterXp != null ? ` · xp ${fmt(s.characterXp)}` : '';
+    lines.push(`🧙 lvl ${s.level}${xp} · 🪙 ${fmt(s.gold ?? 0)}${hp}`);
+  }
+  if (Array.isArray(s.topJobs) && s.topJobs.length) {
+    const jobs = s.topJobs
+      .map((j) => `${j.id} ${j.level}${j.xp != null ? `/${fmt(j.xp)}xp` : ''}`)
+      .join(' · ');
+    lines.push(`🧰 jobs: ${jobs}`);
+  }
+  if (s.prioritizingCharacterLevel) {
+    lines.push(`🎯 leveling character toward lvl ${s.characterLevelTarget}`);
   }
   if (s.quest) lines.push(`📜 quest: \`${s.quest}\``);
   if (s.pubkey) lines.push(`👛 \`${s.pubkey.slice(0, 8)}…${s.pubkey.slice(-4)}\``);

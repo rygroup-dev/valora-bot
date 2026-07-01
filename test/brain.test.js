@@ -30,6 +30,16 @@ describe('decideActivity priority', () => {
     expect(d.type).toBe('upgrade_gear');
   });
 
+  it('prioritizes actionable quests when character leveling is active', () => {
+    const d = decideActivity({
+      ...base,
+      quests: { actionable: true },
+      progression: { prioritizeCharacterLevel: true },
+      profit: { bestCraftProfit: 0, combatValue: 120, gatherValue: 30 },
+    });
+    expect(d).toEqual({ type: 'quest', reason: 'character leveling' });
+  });
+
   it('picks the highest-value profit activity when healthy and idle', () => {
     const d = decideActivity({
       ...base,

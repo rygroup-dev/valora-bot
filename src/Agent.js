@@ -44,6 +44,8 @@ const HEAL_BUY_RESERVE_GOLD = 120;
 const HP_READY_RATIO = 0.95;
 const HP_REST_WINDOW_MS = 5 * 60 * 1000;
 const COMBAT_LOW_HP_LOCK_MS = 2 * 60 * 60 * 1000;
+const CHARACTER_LEVEL_TARGET = 10;
+const CHARACTER_SYNC_MS = 10 * 60 * 1000;
 // Which resource each tool can harvest.
 const TOOL_KIND = { bucheron_axe: 'wood', fishing_rod: 'fish', mining_pick: 'mineral', paysan_sickle: 'cereal' };
 const KIND_TOOL = { wood: 'bucheron_axe', fish: 'fishing_rod', mineral: 'mining_pick', cereal: 'paysan_sickle' };
@@ -484,6 +486,9 @@ export class Agent {
       // Only "actionable" when a concrete quest step is available — otherwise the
       // Brain would pick a no-op 'quest' (all remaining blocked) and starve gather.
       quests: { actionable: !!this._questAction() },
+      progression: {
+        prioritizeCharacterLevel: this._shouldPrioritizeCharacterLevel(),
+      },
       arena: { available: false },
       profit: {
         // Value combat only when a winnable fight is available, we're not in a
@@ -519,6 +524,7 @@ export class Agent {
       return;
     }
     const ctx = this._ctx();
+    await this._syncCharacterSnapshot();
 
     // Progress notifications: level ups and notable gold gains.
     const lvl = ctx.player.level;
@@ -569,14 +575,6 @@ export class Agent {
       }
       this.lastActivity = 'hp_recover';
       if (this._healToUse()) return this._doUseHeal();
-      return this._doRest();
-    }
-
-    if (this.safety.mode === 'active' && this._needsStartupRecovery()) {
-      if (this.lastActivity !== 'startup_recover') {
-        this._event('❤️ startup HP recovery — resting before first combat');
-      }
-      this.lastActivity = 'startup_recover';
       return this._doRest();
     }
 
@@ -942,6 +940,48 @@ export class Agent {
     this._noteOwnedTools(); // remember tools before any view can go stale
     if (player?.pods) this._pods = player.pods; // {used,max}
     else if (view.pods) this._pods = view.pods;
+  }
+
+  _characterXp() {
+    const p = this.character?.save?.player || {};
+    return p.xp ?? p.exp ?? p.experience ?? null;
+  }
+
+  _topJobs(limit = 2) {
+    const jobs = this.character?.save?.player?.jobs || {};
+    return Object.entries(jobs)
+      .map(([id, job]) => ({ id, level: Number(job?.level || 0), xp: job?.xp ?? job?.exp ?? null }))
+      .filter((j) => j.level > 0)
+      .sort((a, b) => b.level - a.level || String(a.id).localeCompare(String(b.id)))
+      .slice(0, limit);
+  }
+
+  _shouldPrioritizeCharacterLevel() {
+    const level = this.character?.save?.player?.level || 1;
+    return level < CHARACTER_LEVEL_TARGET && !!this._questAction();
+  }
+
+  async _syncCharacterSnapshot({ force = false } = {}) {
+    const now = Date.now();
+    if (!force && now - (this._lastCharacterSyncAt || 0) < CHARACTER_SYNC_MS) return;
+    this._lastCharacterSyncAt = now;
+    const current = this.character?.save?.player || {};
+    const beforeLevel = current.level;
+    const beforeXp = this._characterXp();
+    const character = await this.rest.getCharacter().catch(() => null);
+    if (!character?.save?.player) return;
+    this.character = character;
+    this.save.setVersion(character.version || 0);
+    this._noteOwnedTools();
+    const after = character.save.player;
+    const afterXp = after.xp ?? after.exp ?? after.experience ?? null;
+    if (beforeLevel != null && after.level > beforeLevel) {
+      this._event(`🎉 Level up! now level ${after.level}`, { notify: true });
+      this._combatCooldownUntil = 0;
+      this._combatLossStreak = 0;
+    } else if (beforeXp != null && afterXp != null && afterXp !== beforeXp) {
+      this._event(`🧙 character XP ${beforeXp}→${afterXp} (lvl ${after.level || '?'})`);
+    }
   }
 
   _gold() {
@@ -1781,6 +1821,10 @@ export class Agent {
       connected: !!this.room?.connected,
       activity: this.lastActivity,
       level: self.level ?? p.level,
+      characterXp: this._characterXp(),
+      topJobs: this._topJobs(2),
+      characterLevelTarget: CHARACTER_LEVEL_TARGET,
+      prioritizingCharacterLevel: this._shouldPrioritizeCharacterLevel(),
       gold: p.gold,
       hp: this._hp ?? p.hp,
       maxHp: this._maxHp ?? p.maxHp,
