@@ -49,3 +49,29 @@ describe('bridge status text', () => {
     expect(text).toContain('Data: waiting');
   });
 });
+
+describe('agent telemetry formatting', () => {
+  it('reports live pods and fallback pods', () => {
+    const live = Object.assign(Object.create(Agent.prototype), {
+      _pods: { used: 91, max: 100 },
+      _inventory: () => [],
+    });
+    expect(live._podsText()).toBe(' (pods 91/100 91%)');
+
+    const fallback = Object.assign(Object.create(Agent.prototype), {
+      character: { save: { player: { podsMax: 10 } } },
+      _inventory: () => [{ id: 'wood_ash' }, { id: 'wood_oak' }],
+    });
+    expect(fallback._podsText()).toBe(' (pods 2/10 20% fallback)');
+  });
+
+  it('reports HDV slots when the server exposes slot telemetry', () => {
+    const agent = Object.assign(Object.create(Agent.prototype), {
+      hdvConfig: { listingLimit: 10 },
+    });
+
+    expect(agent._hdvSlotText({ activeListings: 9, maxListings: 10 })).toBe(' (HDV slots 9/10)');
+    expect(agent._hdvSlotText({})).toBe(' (HDV slots ?/10)');
+    expect(agent._hdvSlotText({ mineCount: 3 })).toBe(' (HDV slots 3/10)');
+  });
+});

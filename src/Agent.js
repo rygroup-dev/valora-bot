@@ -300,7 +300,7 @@ export class Agent {
         this.hdvConfig = m;
         this._hdvConfigAt = Date.now();
         const bridge = !!(m?.goldBridge ?? this.econConfig?.goldBridge);
-        this._event(`🌉 bridge=${bridge ? 'ON' : 'off'}${m?.tokenUsd ? ` · $VALORA≈$${m.tokenUsd}` : ''}${m?.goldPerToken ? ` · ${m.goldPerToken} gold/token` : ''}`);
+        this._event(`🌉 bridge=${bridge ? 'ON' : 'off'}${m?.tokenUsd ? ` · $VALORA≈$${m.tokenUsd}` : ''}${m?.goldPerToken ? ` · ${m.goldPerToken} gold/token` : ''}${this._hdvSlotText(m)}`);
       })
       .on('hdv_listings', (m) => this._onHdvListings(m))
       .on('hdv_result', (m) => {
@@ -310,19 +310,19 @@ export class Agent {
             // A successful listing consumes one marketplace slot; avoid hammering
             // HDV and let normal farming/selling continue between listings.
             this._hdvCooldownUntil = Date.now() + 2 * 60 * 1000;
-            this._event(`🏷 listed on HDV for $VALORA`, { notify: true });
+            this._event(`🏷 listed on HDV for $VALORA${this._hdvSlotText(m)}${this._podsText(' · ')}`, { notify: true });
           } else if (m?.error === 'too_many_listings') {
             // Marketplace slots are full. Re-trying every 2 minutes was wedging
             // the autopilot into HDV spam with no profit. Cool down and let the
             // bot keep farming / broker-selling until a listing sells or time passes.
             this._hdvCooldownUntil = Date.now() + 60 * 60 * 1000;
-            this._event('hdv list: too_many_listings — cooling down HDV for 60m, continuing broker/gather loop');
+            this._event(`hdv list: too_many_listings${this._hdvSlotText(m)} — cooling down HDV for 60m, continuing broker/gather loop`);
           } else {
-            this._event(`hdv list: ${m.error}`);
+            this._event(`hdv list: ${m.error}${this._hdvSlotText(m)}`);
           }
         }
       })
-      .on('hdv_sold', (m) => this._event(`💸 HDV sale: ${m?.itemId || ''} for ${m?.currency === 'token' ? '$VALORA' : 'gold'}`, { notify: true }))
+      .on('hdv_sold', (m) => this._event(`💸 HDV sale: ${m?.itemId || ''} for ${m?.currency === 'token' ? '$VALORA' : 'gold'}${this._hdvSlotText(m)}`, { notify: true }))
       .on('fee_config', (m) => (this.feeConfig = m))
       .on('stat_reset_config', (m) => (this.statResetConfig = m))
       .on('creature_config', noop)
@@ -547,7 +547,7 @@ export class Agent {
     if (this.safety.mode === 'active' && this._podsRatio() >= 0.9) {
       const cart = sellableCart(this._inventory(), { tools: TOOL_ITEMS, keep: this._reserved() });
       if (cart.length) {
-        if (this.lastActivity !== 'sell_full') this._event('🎒 bag full — selling before continuing');
+        if (this.lastActivity !== 'sell_full') this._event(`🎒 bag full${this._podsText()} — selling before continuing`);
         this.lastActivity = 'sell_full';
         return this._doSell();
       }
@@ -938,6 +938,39 @@ export class Agent {
     if (p && p.max) return p.used / p.max;
     const max = this.character?.save?.player?.podsMax || 100;
     return this._inventory().length / max;
+  }
+  _podsStatus() {
+    const p = this._pods;
+    if (p && p.max) return { used: Number(p.used || 0), max: Number(p.max), source: 'live' };
+    const max = this.character?.save?.player?.podsMax || 100;
+    return { used: this._inventory().length, max, source: 'fallback' };
+  }
+  _podsText(prefix = ' ') {
+    const p = this._podsStatus();
+    if (!p.max) return '';
+    const pct = Math.round((p.used / p.max) * 100);
+    return `${prefix}(pods ${p.used}/${p.max} ${pct}%${p.source === 'fallback' ? ' fallback' : ''})`;
+  }
+  _hdvSlotInfo(source = {}) {
+    const data = source || {};
+    const used = data.activeListings ?? data.listingsUsed ?? data.usedListings ?? data.mineCount ?? data.mineListings ?? data.active ?? data.used;
+    const max = data.maxListings ?? data.listingLimit ?? data.listingsLimit ?? data.maxActiveListings ?? data.max;
+    if (used == null && max == null) return null;
+    return {
+      used: used == null ? null : Number(used),
+      max: max == null ? null : Number(max),
+    };
+  }
+  _hdvSlotText(source = {}, prefix = ' ') {
+    const sourceInfo = this._hdvSlotInfo(source);
+    const configInfo = this._hdvSlotInfo(this.hdvConfig);
+    const info = sourceInfo || configInfo;
+    if (!info) return '';
+    const usedValue = Number.isFinite(info.used) ? info.used : configInfo?.used;
+    const maxValue = Number.isFinite(info.max) ? info.max : configInfo?.max;
+    const used = Number.isFinite(usedValue) ? usedValue : '?';
+    const max = Number.isFinite(maxValue) ? maxValue : '?';
+    return `${prefix}(HDV slots ${used}/${max})`;
   }
   _inventory() {
     return this._serverInventory || this.character?.save?.player?.inventory || [];
@@ -1433,6 +1466,7 @@ export class Agent {
     const listings = m.listings || [];
     if (listings.length && listings[0].itemId !== intent.itemId) return;
     const tokenListings = listings.filter((l) => l.currency === 'token' && !l.mine);
+    const mineListings = listings.filter((l) => l.mine).length;
     const decimals = this.hdvConfig?.decimals ?? 6;
 
     // Detect the live market floor. Keep two memories per item:
@@ -1453,7 +1487,8 @@ export class Agent {
     this._hdvIntent = null;
     const px = (unitPrice / 10 ** decimals).toFixed(0);
     const floorMsg = detected != null ? `market floor ${detected} $VALORA` : 'no competition';
-    this._event(`🏷 listing ${intent.qty}× ${intent.itemId} @ ${px} $VALORA (${floorMsg})`, { notify: true });
+    const listingStats = `listings ${listings.length}${mineListings ? `, mine ${mineListings}` : ''}`;
+    this._event(`🏷 listing ${intent.qty}× ${intent.itemId} @ ${px} $VALORA (${floorMsg}; ${listingStats})${this._hdvSlotText(m)}${this._podsText(' · ')}`, { notify: true });
     this._guardedSend('hdv_list', {
       itemId: intent.itemId,
       qty: intent.qty,
