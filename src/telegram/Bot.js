@@ -201,6 +201,12 @@ export class Bot {
 
   async _run(chatId, cmd, arg, editMsgId, args = [arg]) {
     const agents = this._agentsFor(arg);
+    const sendWithFallback = (text, opts = {}) => this.tg
+      .sendMessage(chatId, text, opts)
+      .catch((e) => {
+        this.log(`[telegram] send ${cmd} failed: ${e?.message || e}`);
+        return this.tg.sendMessage(chatId, text).catch((e2) => this.log(`[telegram] plain send ${cmd} failed: ${e2?.message || e2}`));
+      });
     switch (cmd) {
       case 'start':
       case 'menu':
@@ -208,7 +214,10 @@ export class Bot {
           ? this.tg.sendMessage(chatId, welcomeText(this._labels()), {
               parse_mode: 'Markdown',
               reply_markup: mainMenu(this._labels()),
-            }).catch(() => {})
+            }).catch((e) => {
+              this.log(`[telegram] menu send failed: ${e?.message || e}`);
+              return this.tg.sendMessage(chatId, welcomeText(this._labels())).catch((e2) => this.log(`[telegram] menu plain send failed: ${e2?.message || e2}`));
+            })
           : this.send(chatId, welcomeText(this._labels()));
       case 'help':
         return this.send(chatId, helpText());
@@ -224,9 +233,12 @@ export class Bot {
         if (editMsgId) {
           return this.tg
             .editMessageText(text, { chat_id: chatId, message_id: editMsgId, ...opts })
-            .catch(() => this.tg.sendMessage(chatId, text, opts).catch(() => {}));
+            .catch((e) => {
+              this.log(`[telegram] status edit failed: ${e?.message || e}`);
+              return sendWithFallback(text, opts);
+            });
         }
-        return this.tg.sendMessage(chatId, text, opts).catch(() => {});
+        return sendWithFallback(text, opts);
       }
       case 'health': {
         const now = Date.now();
