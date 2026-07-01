@@ -229,7 +229,10 @@ export class Bot {
       case 'status': {
         if (!agents.length) return this.send(chatId, 'no such agent');
         const text = agents.map((a) => formatStatus(a.statusData())).join('\n\n');
-        const opts = { parse_mode: 'Markdown', reply_markup: mainMenu(this._labels()) };
+        // Status contains live game data (quest/activity/wallet snippets) that can
+        // include Markdown control characters. Send it as plain text so Telegram
+        // never rejects the command while still keeping the inline controls.
+        const opts = { reply_markup: mainMenu(this._labels()) };
         if (editMsgId) {
           return this.tg
             .editMessageText(text, { chat_id: chatId, message_id: editMsgId, ...opts })
