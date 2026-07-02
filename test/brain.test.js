@@ -75,3 +75,20 @@ describe('decideActivity priority', () => {
     expect(d.type).toBe('rest');
   });
 });
+
+describe('rest requires a real recovery option', () => {
+  it('skips rest when nothing can restore HP (server does not heal on rest)', () => {
+    const d = decideActivity({
+      ...base,
+      player: { ...base.player, hp: 0 },
+      canRecover: false,
+      profit: { bestCraftProfit: 0, combatValue: 0, gatherValue: 10 },
+    });
+    expect(d.type).toBe('gather');
+  });
+
+  it('still rests when food is available to eat/craft/buy', () => {
+    const d = decideActivity({ ...base, player: { ...base.player, hp: 0 }, canRecover: true });
+    expect(d.type).toBe('rest');
+  });
+});

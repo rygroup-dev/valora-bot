@@ -83,6 +83,38 @@ export function healConsumableReserve(targetQty = 6) {
   return keep;
 }
 
+// Raw ingredients we must NOT sell while the heal-food stock is below target —
+// otherwise the fish gets sold to the broker before it can ever be cooked and
+// the character has nothing to recover HP with (rest does not heal on the live
+// server; eating is the only verified recovery). Only level-1 recipes matter:
+// they are always craftable, so their inputs are always worth holding.
+export function healInputReserve(recipeMap = {}, inventory = [], targetQty = 6, { craftableLevelOk = () => false } = {}) {
+  const deficit = targetQty - healConsumableQty(inventory);
+  if (deficit <= 0) return {};
+  const keep = {};
+  for (const h of HEAL_CONSUMABLES) {
+    const rec = recipeMap[h.id];
+    if (!rec?.inputs?.length) continue;
+    if ((rec.levelReq || 1) > 1 && !craftableLevelOk(rec)) continue;
+    for (const it of rec.inputs) {
+      keep[it.id] = Math.max(keep[it.id] || 0, (it.qty || 1) * deficit);
+    }
+  }
+  return keep;
+}
+
+// Merge reservation maps taking the max per item (spreading objects would let a
+// later map silently lower a quantity another reservation still needs).
+export function mergeReserve(...maps) {
+  const out = {};
+  for (const m of maps) {
+    for (const [id, qty] of Object.entries(m || {})) {
+      out[id] = Math.max(out[id] || 0, qty || 0);
+    }
+  }
+  return out;
+}
+
 // Cart of resources to sell — everything that isn't a tool or a quest item,
 // minus any per-item quantity we want to keep.
 export function sellableCart(inventory = [], { tools = [], keep = {} } = {}) {

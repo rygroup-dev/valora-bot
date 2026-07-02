@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { healConsumableReserve, healConsumableToBuy, sellableCart, toolToBuy } from '../src/game/vendor.js';
+import { healConsumableReserve, healConsumableToBuy, healInputReserve, mergeReserve, sellableCart, toolToBuy } from '../src/game/vendor.js';
 
 const TOOLS = ['bucheron_axe', 'fishing_rod', 'mining_pick', 'paysan_sickle'];
 
@@ -82,5 +82,43 @@ describe('healConsumableToBuy', () => {
       blocked: new Set(['dish_wolf_stew']),
     });
     expect(pick).toBeNull();
+  });
+});
+
+describe('healInputReserve', () => {
+  const RECIPES = {
+    dish_minnow: { id: 'cook_fish_minnow', kind: 'cuisine', levelReq: 1, inputs: [{ id: 'fish_minnow', qty: 1 }] },
+    dish_gudgeon: { id: 'cook_fish_gudgeon', kind: 'cuisine', levelReq: 1, inputs: [{ id: 'fish_gudgeon', qty: 1 }] },
+    dish_trout_pie: { id: 'cook_trout_pie', kind: 'cuisine', levelReq: 12, inputs: [{ id: 'fish_trout', qty: 2 }] },
+  };
+
+  it('reserves raw inputs of level-1 dishes to cover the food deficit', () => {
+    const keep = healInputReserve(RECIPES, [], 6);
+    expect(keep.fish_minnow).toBe(6);
+    expect(keep.fish_gudgeon).toBe(6);
+    expect(keep.fish_trout).toBeUndefined(); // level-gated recipe, not craftable
+  });
+
+  it('reserves nothing once the food stock meets the target', () => {
+    const inv = [{ id: 'dish_minnow', qty: 6 }];
+    expect(healInputReserve(RECIPES, inv, 6)).toEqual({});
+  });
+
+  it('shrinks the reservation as dishes accumulate', () => {
+    const inv = [{ id: 'dish_minnow', qty: 4 }];
+    const keep = healInputReserve(RECIPES, inv, 6);
+    expect(keep.fish_minnow).toBe(2);
+  });
+
+  it('includes level-gated recipes when the job level allows them', () => {
+    const keep = healInputReserve(RECIPES, [], 2, { craftableLevelOk: () => true });
+    expect(keep.fish_trout).toBe(4); // qty 2 per craft x deficit 2
+  });
+});
+
+describe('mergeReserve', () => {
+  it('takes the max per item instead of letting a later map lower it', () => {
+    const merged = mergeReserve({ fish_gudgeon: 3, wood_ash: 2 }, { fish_gudgeon: 1, dish_minnow: 8 });
+    expect(merged).toEqual({ fish_gudgeon: 3, wood_ash: 2, dish_minnow: 8 });
   });
 });

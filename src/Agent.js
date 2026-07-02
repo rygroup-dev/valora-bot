@@ -27,7 +27,7 @@ const RESOURCE_KIND = (id) =>
   : id.startsWith('ore_') ? 'mineral'
   : id.startsWith('cereal_') ? 'cereal'
   : null;
-import { bestHealToUse, healConsumableQty, healConsumableReserve, healConsumableToBuy, HEAL_CONSUMABLES, sellableCart, toolToBuy } from './game/vendor.js';
+import { bestHealToUse, healConsumableQty, healConsumableReserve, healConsumableToBuy, healInputReserve, mergeReserve, HEAL_CONSUMABLES, sellableCart, toolToBuy } from './game/vendor.js';
 import { planTurn } from './game/combatAI.js';
 import { chooseHdvListing, hdvTokenUnitPrice, marketFloorToken } from './game/hdv.js';
 import { questReservations } from './game/reserve.js';
@@ -80,6 +80,7 @@ export class Agent {
     this.log = (m) => log(`[${this.label}] ${m}`);
     this.store = store;
     this._combatCooldownKey = `valora:combatCooldown:v1:${wallet.publicKey}`;
+    this._hpLedgerKey = `valora:hp:v1:${wallet.publicKey}`;
 
     this.rest = new RestClient({ base: config.base });
     this.auth = new Auth({ rest: this.rest, wallet, store, log: this.log });
@@ -120,7 +121,12 @@ export class Agent {
     this.combatDelta = 0;
     this._startupRecoverUntil = Date.now() + HP_REST_WINDOW_MS;
     this._hpTrusted = false;
+    this._staleCellCounts = new Map(); // cell -> consecutive no-response harvests
+    this._permBlockedCells = new Set(); // cells that never respond — never retried
+    this._missingInputFirstAt = new Map(); // questId:step:item -> first-seen ts
+    this._fairLossStreak = 0; // losses that started at healthy HP (gear/level gap)
     this._restoreCombatCooldown();
+    this._restoreHpLedger();
     // Cross-map travel: gate_check → walk to portal → await-leave + re-join the
     // destination room (the anti-teleport-safe flow the live client uses). Live-
     // verified round-trip city↔mine1 with ore gathering, so it's enabled.
@@ -289,6 +295,7 @@ export class Agent {
           this._event(`🍞 used ${heal.id} (+${heal.heal} HP${before == null ? '' : `, ${before}->${this._hp ?? '?'}`})`);
           this._lastHealUse = null;
           this._restingUntil = 0;
+          this._saveHpLedger();
         }
         if (m?.op === 'use' && m.ok === false) {
           if (this._lastHealUse) this._event(`heal use failed: ${this._lastHealUse.id} (${m.error || 'unknown'})`);
@@ -391,7 +398,7 @@ export class Agent {
           : '';
         this._gathered = (this._gathered || 0) + 1;
         this._busyHarvesting = false;
-        if (m?.cell != null) { this._harvesting.delete(m.cell); this._blockedCells.delete(m.cell); }
+        if (m?.cell != null) { this._harvesting.delete(m.cell); this._blockedCells.delete(m.cell); this._staleCellCounts.delete(m.cell); }
         this._event(`🌿 harvested${m?.xp ? ` +${m.xp}xp` : ''}${drops ? ` (${drops})` : ''} [#${this._gathered}]`);
         this._noteQuestGather(m);
       })
@@ -401,6 +408,14 @@ export class Agent {
         this.safety.recordDenied('harvest');
         const reason = m?.reason || JSON.stringify(m);
         const spot = this._lastSpot;
+        // Always surface WHY (throttled): silent denials made past wedges
+        // (tool/range/level loops) invisible in the logs for days.
+        const denyKey = `${reason}:${spot?.cell ?? '?'}`;
+        if (this._lastDenyKey !== denyKey || Date.now() - (this._lastDenyAt || 0) > 60000) {
+          this._lastDenyKey = denyKey;
+          this._lastDenyAt = Date.now();
+          this.log(`harvest denied (${reason})${spot ? ` ${spot.resource}@${spot.cell}` : ''}`);
+        }
         if (reason === 'tool') {
           const type = spot?.type;
           const tool = KIND_TOOL[type];
@@ -433,6 +448,7 @@ export class Agent {
         this._applyView(m?.view);
         if (won) {
           this._fightsWon = (this._fightsWon || 0) + 1;
+          this._fairLossStreak = 0;
           this._clearCombatCooldown();
           this._event(`⚔️ fight won${m?.xp ? ` +${m.xp}xp` : ''} [#${this._fightsWon || 0}]`, { notify: true });
         } else {
@@ -442,6 +458,13 @@ export class Agent {
           this._restingUntil = 0;
           const start = this._fightStartHp;
           const startedDangerouslyLow = start?.maxHp && start.hp / start.maxHp <= 0.2;
+          // A loss that STARTED healthy means the mob tier is simply too strong
+          // for our current gear/level — remember it so target selection drops
+          // to weaker mobs instead of feeding the same fight forever.
+          if (start?.maxHp && start.hp / start.maxHp >= 0.8) {
+            this._fairLossStreak = (this._fairLossStreak || 0) + 1;
+            if (this._fairLossStreak === 2) this._event('🧠 losing at full HP vs equal mobs — switching to weaker targets');
+          }
           this._combatCooldownUntil = Date.now() + (startedDangerouslyLow ? COMBAT_LOW_HP_LOCK_MS : 60 * 60 * 1000);
           if (startedDangerouslyLow) this._combatLowHpLockUntil = this._combatCooldownUntil;
           this._saveCombatCooldown(startedDangerouslyLow ? 'low_hp_loss' : 'loss');
@@ -452,6 +475,7 @@ export class Agent {
           }
         }
         this._fightStartHp = null;
+        this._saveHpLedger();
       })
       .on('fight_denied', () => this.safety.recordDenied('engageFight'))
       .on('fight', (m) => this._onFight(m))
@@ -490,9 +514,8 @@ export class Agent {
     return {
       snap,
       player: {
-        // HP comes from the last fight snapshot (the only place it's exposed).
-        // While "resting", we report low HP so the Brain keeps resting; once the
-        // rest timer elapses we assume full. Before any fight, assume healthy.
+        // HP comes from the last fight snapshot (the only place it's exposed)
+        // and from the eat-food ledger. Before any fight, assume healthy.
         hp: this._maxHp ? (this._hp ?? this._maxHp) : 50,
         maxHp: this._maxHp || 50,
         level: liveLevel,
@@ -500,6 +523,9 @@ export class Agent {
         podsUsed: (p.inventory || []).length,
         podsMax: p.podsMax ?? 100,
       },
+      // Resting can't heal on the live server — only food can. Tell the Brain so
+      // it never parks a food-less character in an endless rest loop.
+      canRecover: !!(this._healToUse() || this._healToCraft() || this._healToBuy()),
       hasGearUpgrade:
         bestLoadout({
           inventory: p.inventory || [],
@@ -527,7 +553,7 @@ export class Agent {
                 self: { level: liveLevel, cell: this.heroCell },
                 minLevelDelta: combatWindow.minDelta,
                 maxLevelDelta: combatWindow.maxDelta,
-                prefer: 'equal',
+                prefer: (this._fairLossStreak || 0) >= 2 ? 'weakest' : 'equal',
               })
               ? 55
               : 0,
@@ -595,12 +621,19 @@ export class Agent {
     // HP is only visible in combat, so once we have a snapshot we keep recovering
     // until it is near full before letting combat/quests/economy continue.
     if (this.safety.mode === 'active' && this._needsHpRecovery()) {
-      if (this.lastActivity !== 'hp_recover') {
-        this._event(`❤️ HP recovery gate (${this._hp}/${this._maxHp}) — healing before action`);
+      // Eating is the only recovery the live server actually honors (rest does
+      // not heal). Eat what we have, else cook from raw fish, else buy. When
+      // none of those is possible, DON'T block: keep gathering/selling so the
+      // food pipeline can restock — combat stays locked via the trusted-HP gate.
+      if (this._healToUse() || this._healToCraft() || this._healToBuy()) {
+        if (this.lastActivity !== 'hp_recover') {
+          this._event(`❤️ HP recovery gate (${this._hp}/${this._maxHp}) — healing before action`);
+        }
+        this.lastActivity = 'hp_recover';
+        if (this._healToUse()) return this._doUseHeal();
+        if (this._healToCraft()) return this._doCraftHeal();
+        return this._doBuyHeal();
       }
-      this.lastActivity = 'hp_recover';
-      if (this._healToUse()) return this._doUseHeal();
-      return this._doRest();
     }
 
     // Starter quests come first — they grant the first gathering tool, which
@@ -698,10 +731,11 @@ export class Agent {
       return this._guardedSend('rest_start', {});
     }
     if (now >= this._restingUntil) {
-      this._hp = this._maxHp || this._hp; // assume recovered
-      this._hpTrusted = false; // timer-only recovery is not proof the server healed us
+      // Do NOT assume the rest healed us — the live server has shown it doesn't.
+      // The HP ledger keeps its last verified value; combat stays gated on it
+      // and recovery comes from eating (recovery gate / in-fight heals).
       this._restingUntil = 0;
-      this._event('🟢 rested — HP assumed full, back to action');
+      this._event('🟢 rest window over — resuming work (HP ledger unchanged)');
       return;
     }
     return this._guardedSend('rest_start', {});
@@ -720,7 +754,7 @@ export class Agent {
       self: { ...ctx.player, cell: this.heroCell },
       minLevelDelta: combatWindow.minDelta,
       maxLevelDelta: combatWindow.maxDelta,
-      prefer: 'equal',
+      prefer: (this._fairLossStreak || 0) >= 2 ? 'weakest' : 'equal',
     });
     if (!target || target.gid == null) return;
 
@@ -892,7 +926,17 @@ export class Agent {
       if (Date.now() - this._harvestAt > 12000) {
         const stale = [...this._harvesting];
         this._harvesting.clear();
-        for (const cell of stale) this._blockedCells.add(cell);
+        for (const cell of stale) {
+          this._blockedCells.add(cell);
+          // A cell the server repeatedly never answers for is dead to us — block
+          // it permanently (the 5-min self-heal only clears transient blocks).
+          const n = (this._staleCellCounts.get(cell) || 0) + 1;
+          this._staleCellCounts.set(cell, n);
+          if (n >= 3 && !this._permBlockedCells.has(cell)) {
+            this._permBlockedCells.add(cell);
+            this._event(`🚫 cell ${cell} never responds to harvest (${n}×) — blocking it for this session`);
+          }
+        }
         this._busyHarvesting = false;
         this._event(`🌿 harvest stale${stale.length ? ` (${stale.join(',')})` : ''} — retrying`);
       } else return;
@@ -904,7 +948,7 @@ export class Agent {
     const kinds = wantResource ? [RESOURCE_KIND(wantResource)].filter(Boolean) : this._effectiveKinds();
     if (!kinds.length) return; // no tools for any resource yet
     // Busy = cells we already started + cooldown nodes + cells that kept denying.
-    const busy = new Set([...this._harvesting, ...this._blockedCells]);
+    const busy = new Set([...this._harvesting, ...this._blockedCells, ...this._permBlockedCells]);
     for (const n of snapshot(this.room.state).nodes) busy.add(n.cell);
 
     const target = this.mapData.pickGatherTarget(this.heroCell, {
@@ -1205,7 +1249,8 @@ export class Agent {
           if (!this._bumpStepTries(sa, 3)) return this._blockQuest(sa.questId, `need ${tool}`);
           return;
         }
-        const hasSpot = this.mapData.spots(kind ? [kind] : undefined).some((s) => s.resource === want);
+        const hasSpot = this.mapData.spots(kind ? [kind] : undefined)
+          .some((s) => s.resource === want && !this._permBlockedCells.has(s.cell));
         if (!hasSpot) {
           // Cross-map travel (RESOURCE_MAP / _travelTo) is implemented but the
           // server-side map-transition trigger isn't confirmed yet, so we skip
@@ -1240,6 +1285,17 @@ export class Agent {
         if (kind) {
           const key = `${sa.questId}:${sa.step}:${missing.id}`;
           const now = Date.now();
+          // Give up after 10 minutes of zero progress on this input — a spot
+          // that never yields (e.g. a harvest the server silently drops) must
+          // not wedge the whole autopilot in a gather loop forever.
+          const have = this._invQty(missing.id);
+          const seen = this._missingInputFirstAt.get(key);
+          if (!seen || seen.had !== have) {
+            this._missingInputFirstAt.set(key, { at: now, had: have });
+          } else if (now - seen.at > 10 * 60 * 1000) {
+            this._missingInputFirstAt.delete(key);
+            return this._blockQuest(sa.questId, `cannot obtain ${missing.id} (10m no progress)`);
+          }
           if (this._lastMissingQuestInputKey !== key || now - (this._lastMissingQuestInputAt || 0) > 15000) {
             this._lastMissingQuestInputKey = key;
             this._lastMissingQuestInputAt = now;
@@ -1303,14 +1359,19 @@ export class Agent {
   // Items we must NOT sell because an active/upcoming quest still needs them.
   _reserved() {
     const qs = this._questState();
-    return {
-      ...questReservations(QUEST_CATALOG, {
-      active: qs.active,
-      completed: qs.completed,
-      blocked: qs.blocked,
+    return mergeReserve(
+      questReservations(QUEST_CATALOG, {
+        active: qs.active,
+        completed: qs.completed,
+        blocked: qs.blocked,
       }),
-      ...healConsumableReserve(HEAL_STOCK_TARGET),
-    };
+      healConsumableReserve(HEAL_STOCK_TARGET),
+      // Keep the raw fish that low-level dishes are cooked from until the food
+      // stock is full — selling them was starving the whole HP pipeline.
+      healInputReserve(RECIPE_MAP, this._inventory(), HEAL_STOCK_TARGET, {
+        craftableLevelOk: (rec) => this._craftJobLevelOk(rec),
+      }),
+    );
   }
 
   // Decide a buy/sell action (string) or null.
@@ -1726,18 +1787,22 @@ export class Agent {
     if (Date.now() < (this._combatCooldownUntil || 0)) return false;
     if (Date.now() < (this._combatLowHpLockUntil || 0)) return false;
     if (this._needsHpRecovery() || this._needsStartupRecovery()) return false;
-    // On Apex, a timer-based rest assumption is not enough: the live server has
-    // shown main can still enter combat at 1/80 HP. Require a trusted HP source
-    // (fight snapshot or successful heal-to-ready) before risking another fight.
-    if (this._isMainApex() && this._maxHp && !this._hpTrusted) return false;
+    // A timer-based rest assumption is not enough on ANY shard: the live server
+    // does not heal on rest, and every account that engaged on assumed-full HP
+    // lost at ~0 HP and ate a 2h lockout. Require a trusted HP source (fight
+    // snapshot or eating up to ready) before risking a fight.
+    if (this._maxHp && !this._hpTrusted) return false;
     if (this._pendingEquip && ['iron_sword', ...ARMOR_ITEMS].includes(this._pendingEquip)) return false;
     if (!this._combatGearReady(level)) return false;
     return true;
   }
 
   _combatTargetWindow(level = 1) {
-    // Trainer mode: fight mobs at exactly our character level. After losses,
-    // cooldown handles recovery instead of silently switching to unrelated mobs.
+    // Trainer mode: fight mobs at exactly our character level — but after two
+    // losses that STARTED at healthy HP, drop to weaker mobs (up to 2 levels
+    // below) until a win proves we can step back up. XP from a winnable fight
+    // beats a 2h lockout from an unwinnable one.
+    if ((this._fairLossStreak || 0) >= 2) return { minDelta: -2, maxDelta: 0 };
     return { minDelta: 0, maxDelta: 0 };
   }
 
@@ -1781,7 +1846,32 @@ export class Agent {
     this._combatCooldownUntil = 0;
     this._combatLowHpLockUntil = 0;
     this._combatLossStreak = 0;
+    this._fairLossStreak = 0;
     this.store?.del?.(this._combatCooldownKey);
+  }
+
+  // HP survives restarts server-side, but the bot only learns it inside a fight.
+  // Persisting the last known value stops the restart-amnesia death loop where a
+  // freshly started bot walks into combat at 0 HP it "forgot" about.
+  _restoreHpLedger() {
+    const saved = this.store?.get?.(this._hpLedgerKey);
+    if (!saved || typeof saved !== 'object') return;
+    if (Date.now() - Number(saved.at || 0) > 48 * 60 * 60 * 1000) return; // too old to trust
+    if (typeof saved.hp === 'number' && typeof saved.maxHp === 'number' && saved.maxHp > 0) {
+      this._hp = saved.hp;
+      this._maxHp = saved.maxHp;
+      this._hpTrusted = !!saved.trusted;
+    }
+  }
+
+  _saveHpLedger() {
+    if (!this._maxHp || typeof this._hp !== 'number') return;
+    this.store?.set?.(this._hpLedgerKey, {
+      hp: this._hp,
+      maxHp: this._maxHp,
+      trusted: !!this._hpTrusted,
+      at: Date.now(),
+    });
   }
 
   _healsForFight(missingHp = Infinity) {

@@ -19,7 +19,12 @@ export function decideActivity(ctx) {
   const hpRatio = p.maxHp ? p.hp / p.maxHp : 1;
   const podsRatio = p.podsMax ? p.podsUsed / p.podsMax : 0;
 
-  if (hpRatio <= HP_REST) return { type: 'rest', reason: `hp ${Math.round(hpRatio * 100)}%` };
+  // Rest only when something can actually restore HP (food to eat/craft/buy).
+  // The live server does not heal on rest, so with no recovery available the
+  // right move is to keep gathering — combat is gated separately on trusted HP.
+  if (hpRatio <= HP_REST && (ctx.canRecover ?? true)) {
+    return { type: 'rest', reason: `hp ${Math.round(hpRatio * 100)}%` };
+  }
   if (podsRatio >= PODS_FULL) return { type: 'bank', reason: `pods ${Math.round(podsRatio * 100)}%` };
   if ((p.statPoints || 0) > 0) return { type: 'allocate_stats', reason: `${p.statPoints} points` };
   if (ctx.hasGearUpgrade) return { type: 'upgrade_gear', reason: 'better gear available' };

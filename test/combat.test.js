@@ -160,7 +160,7 @@ describe('Agent HP recovery gate', () => {
     expect(agent._combatReady(4)).toBe(true);
   });
 
-  it('allows non-Apex combat with timer-assumed HP after recovery', () => {
+  it('blocks combat on ANY shard when HP is only timer-assumed (rest does not heal)', () => {
     const agent = Object.assign(Object.create(Agent.prototype), {
       label: 'sub8',
       shardId: '1',
@@ -174,7 +174,16 @@ describe('Agent HP recovery gate', () => {
       _equipped: () => ({}),
     });
 
+    expect(agent._combatReady(4)).toBe(false);
+    agent._hpTrusted = true; // e.g. verified by a fight snapshot or eating to full
     expect(agent._combatReady(4)).toBe(true);
+  });
+
+  it('drops to weaker mobs after two losses that started at healthy HP', () => {
+    const agent = Object.assign(Object.create(Agent.prototype), { _fairLossStreak: 2 });
+    expect(agent._combatTargetWindow(4)).toEqual({ minDelta: -2, maxDelta: 0 });
+    agent._fairLossStreak = 0;
+    expect(agent._combatTargetWindow(4)).toEqual({ minDelta: 0, maxDelta: 0 });
   });
 
   it('blocks trainer combat until required gear is owned or confirmed unavailable', () => {
