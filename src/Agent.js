@@ -290,12 +290,20 @@ export class Agent {
         if (m?.op === 'use' && m.ok !== false && this._lastHealUse) {
           const heal = this._lastHealUse;
           const before = this._hp;
-          if (this._maxHp && typeof this._hp === 'number') this._hp = Math.min(this._maxHp, this._hp + heal.heal);
+          // Trust the SERVER-reported heal amount when present — the assumed
+          // catalog value once credited +15s the server never applied.
+          const healed = typeof m.heal === 'number' ? m.heal : heal.heal;
+          if (this._maxHp && typeof this._hp === 'number') this._hp = Math.min(this._maxHp, this._hp + healed);
           if (this._maxHp && typeof this._hp === 'number' && this._hp / this._maxHp >= HP_READY_RATIO) this._hpTrusted = true;
-          this._event(`🍞 used ${heal.id} (+${heal.heal} HP${before == null ? '' : `, ${before}->${this._hp ?? '?'}`})`);
+          this._event(`🍞 used ${heal.id} (+${healed} HP${typeof m.heal === 'number' ? '' : ' assumed'}${before == null ? '' : `, ${before}->${this._hp ?? '?'}`})`);
           this._lastHealUse = null;
-          this._restingUntil = 0;
+          this._restingSince = 0;
           this._saveHpLedger();
+          // Out-of-combat HP is client-authoritative — persist once we're ready.
+          if (this._hpTrusted && !this._needsHpRecovery()) {
+            this._persistHp().catch((e) => this.log(`persistHp: ${e?.message}`));
+            this._maybeUnlockCombat();
+          }
         }
         if (m?.op === 'use' && m.ok === false) {
           if (this._lastHealUse) this._event(`heal use failed: ${this._lastHealUse.id} (${m.error || 'unknown'})`);
@@ -455,7 +463,7 @@ export class Agent {
           // Loss-backoff: after repeated losses, pause combat and return to safe
           // gathering/quests so the bot stops bleeding until it grows stronger.
           this._combatLossStreak = (this._combatLossStreak || 0) + 1;
-          this._restingUntil = 0;
+          this._restingSince = 0;
           const start = this._fightStartHp;
           const startedDangerouslyLow = start?.maxHp && start.hp / start.maxHp <= 0.2;
           // A loss that STARTED healthy means the mob tier is simply too strong
@@ -476,6 +484,31 @@ export class Agent {
         }
         this._fightStartHp = null;
         this._saveHpLedger();
+      })
+      .on('rest', (m) => {
+        // Server rest tick {ok, hp, capped} — the only out-of-combat verified
+        // HP source. Track it, and on cap persist to the character save.
+        if (m?.ok === false) {
+          this._restingSince = 0;
+          this._restBrokenUntil = Date.now() + 10 * 60 * 1000;
+          this._event(`🛌 rest denied${m?.reason ? ` (${m.reason})` : ''} — falling back to food for 10m`);
+          return;
+        }
+        this._lastRestTickAt = Date.now();
+        if (typeof m?.hp === 'number') {
+          this._hp = Math.max(this._hp ?? 0, m.hp);
+          this._hpTrusted = true;
+        }
+        if (m?.capped) {
+          if (this._maxHp) this._hp = Math.max(this._hp ?? 0, this._maxHp);
+          this._hpTrusted = true;
+          this._restingSince = 0;
+          this._restBrokenUntil = 0;
+          this._saveHpLedger();
+          this._event(`🟢 rest capped — HP full (${this._hp}/${this._maxHp ?? '?'})`, { notify: true });
+          this._persistHp().catch((e) => this.log(`persistHp: ${e?.message}`));
+          this._maybeUnlockCombat();
+        }
       })
       .on('fight_denied', (m) => {
         this.safety.recordDenied('engageFight');
@@ -643,14 +676,19 @@ export class Agent {
     // HP is only visible in combat, so once we have a snapshot we keep recovering
     // until it is near full before letting combat/quests/economy continue.
     if (this.safety.mode === 'active' && this._needsHpRecovery()) {
-      // Eating is the only recovery the live server actually honors (rest does
-      // not heal). Eat what we have, else cook from raw fish, else buy. When
-      // none of those is possible, DON'T block: keep gathering/selling so the
-      // food pipeline can restock — combat stays locked via the trusted-HP gate.
+      if (this.lastActivity !== 'hp_recover') {
+        this._event(`❤️ HP recovery gate (${this._hp}/${this._maxHp}) — recovering before action`);
+      }
+      // Rest is the primary recovery: free, and the server streams verified HP
+      // ticks (`rest` messages) until capped — persisted via /character/save.
+      if (!this._restBroken()) {
+        this.lastActivity = 'hp_recover';
+        return this._doRest();
+      }
+      // Rest not working → eat what we have, else cook from raw fish, else buy.
+      // When none is possible, DON'T block: keep gathering/selling so the food
+      // pipeline restocks — combat stays locked via the trusted-HP gate.
       if (this._healToUse() || this._healToCraft() || this._healToBuy()) {
-        if (this.lastActivity !== 'hp_recover') {
-          this._event(`❤️ HP recovery gate (${this._hp}/${this._maxHp}) — healing before action`);
-        }
         this.lastActivity = 'hp_recover';
         if (this._healToUse()) return this._doUseHeal();
         if (this._healToCraft()) return this._doCraftHeal();
@@ -741,26 +779,83 @@ export class Agent {
     return this.room.send(action, payload);
   }
 
-  // Rest to recover HP. We can't see HP out of combat, so we rest for a fixed
-  // window then assume full (the next fight's snapshot confirms whether resting
-  // actually healed — if not, the loss-backoff keeps us safe and the logs show
-  // it). Sends rest_start once, re-sends periodically while the timer runs.
+  // Rest to recover HP. The live client protocol (RE'd from the bundle): send
+  // `rest_start{}` once, the server streams `rest` messages `{ok, hp, capped}`
+  // with the REAL regenerating HP until it caps at full — those ticks are our
+  // verified HP source. Out-of-combat HP is client-authoritative: after the
+  // cap we must persist it via PUT /character/save or the next fight starts
+  // from the old saved HP (this is exactly why every fight began at 1/80).
+  _restBroken() {
+    return Date.now() < (this._restBrokenUntil || 0);
+  }
+
+  // A low-HP combat lockout is uninformative once HP is verified full again —
+  // those losses were fights that started at 1 HP, not evidence about mob
+  // strength. Unlock combat so the (now healthy) character can earn XP.
+  _maybeUnlockCombat() {
+    if (!this._hpTrusted || this._needsHpRecovery()) return;
+    if (Date.now() < (this._combatLowHpLockUntil || 0)) {
+      this._clearCombatCooldown();
+      this._event('⚔️ HP verified full — combat unlocked early');
+    }
+  }
+
   _doRest() {
     const now = Date.now();
-    if (!this._restingUntil) {
-      this._restingUntil = now + HP_REST_WINDOW_MS; // give HP time to actually recover
+    if (!this._restingSince) {
+      this._restingSince = now;
+      this._lastRestTickAt = 0;
+      this._lastRestSendAt = now;
       this._event(`🛌 resting to recover HP (${this._hp ?? '?'}/${this._maxHp ?? '?'})…`, { notify: true });
       return this._guardedSend('rest_start', {});
     }
-    if (now >= this._restingUntil) {
-      // Do NOT assume the rest healed us — the live server has shown it doesn't.
-      // The HP ledger keeps its last verified value; combat stays gated on it
-      // and recovery comes from eating (recovery gate / in-fight heals).
-      this._restingUntil = 0;
-      this._event('🟢 rest window over — resuming work (HP ledger unchanged)');
+    // No rest tick at all → the rest isn't running; fall back to food for a while.
+    if (!this._lastRestTickAt && now - this._restingSince > 90 * 1000) {
+      this._restingSince = 0;
+      this._restBrokenUntil = now + 30 * 60 * 1000;
+      this._event('🛌 rest produced no HP ticks in 90s — falling back to food for 30m');
       return;
     }
-    return this._guardedSend('rest_start', {});
+    // Safety cap on one rest session.
+    if (now - this._restingSince > 20 * 60 * 1000) {
+      this._restingSince = 0;
+      this._restBrokenUntil = now + 15 * 60 * 1000;
+      this._event('🛌 rest never capped after 20m — falling back to food');
+      return;
+    }
+    // Re-nudge occasionally in case the start was lost (reconnects etc).
+    if (now - (this._lastRestSendAt || 0) > 30 * 1000) {
+      this._lastRestSendAt = now;
+      return this._guardedSend('rest_start', {});
+    }
+  }
+
+  // Persist the recovered HP into the character save (optimistic-lock PUT).
+  // Fetch a FRESH copy first and mutate only hp/maxHp — pushing our possibly
+  // stale local view could clobber server-side inventory/gold.
+  async _persistHp() {
+    if (!this._maxHp || typeof this._hp !== 'number') return false;
+    const now = Date.now();
+    if (now - (this._lastHpPersistAt || 0) < 15 * 1000) return false;
+    this._lastHpPersistAt = now;
+    try {
+      const fresh = await this.rest.getCharacter();
+      const player = fresh?.save?.player;
+      if (!player) return false;
+      player.hp = this._hp;
+      if (this._maxHp && (!player.maxHp || player.maxHp < this._maxHp)) player.maxHp = this._maxHp;
+      this.save.setVersion(fresh.version || 0);
+      const r = await this.save.save(fresh.save);
+      if (r.ok) {
+        this._event(`💾 HP ${this._hp}/${this._maxHp} persisted to character save`);
+        return true;
+      }
+      this.log(`hp save failed: ${r.error}`);
+      return false;
+    } catch (e) {
+      this.log(`hp save error: ${e?.message}`);
+      return false;
+    }
   }
 
   async _doCombat(ctx) {
