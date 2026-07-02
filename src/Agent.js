@@ -477,7 +477,20 @@ export class Agent {
         this._fightStartHp = null;
         this._saveHpLedger();
       })
-      .on('fight_denied', () => this.safety.recordDenied('engageFight'))
+      .on('fight_denied', (m) => {
+        this.safety.recordDenied('engageFight');
+        // The engage didn't start a fight (e.g. another player/agent grabbed the
+        // mob first). Without this reset the agent sat in `inFight` forever.
+        this.inFight = false;
+        this.fightState = null;
+        this._placed = false;
+        // Don't immediately re-race for the same mob (likely already taken).
+        if (this._lastEngageGid != null) {
+          if (!this._gidCooldowns) this._gidCooldowns = new Map();
+          this._gidCooldowns.set(this._lastEngageGid, Date.now() + 90 * 1000);
+        }
+        this._event(`⚔️ engage denied${m?.reason ? ` (${m.reason})` : ''} — back to work`);
+      })
       .on('fight', (m) => this._onFight(m))
       .on('relocate', (m) => {
         if (typeof m?.cell === 'number') this.heroCell = m.cell;
@@ -572,8 +585,17 @@ export class Agent {
     // While a fight is in progress it's driven entirely by `fight` events
     // (_onFight). Don't let the normal tick fire rest/gather/econ mid-combat.
     if (this.inFight) {
-      await sleep(800);
-      return;
+      // Watchdog: an engage that never produced a fight event (silent server
+      // drop, mob grabbed by someone else) must not wedge the agent forever.
+      if (!this.fightState && this._engageAt && Date.now() - this._engageAt > 25000) {
+        this.inFight = false;
+        this._placed = false;
+        this._engageAt = 0;
+        this._event('⚔️ engage timed out (no fight started) — back to work');
+      } else {
+        await sleep(800);
+        return;
+      }
     }
     const ctx = this._ctx();
     await this._syncCharacterSnapshot();
@@ -757,6 +779,7 @@ export class Agent {
       prefer: (this._fairLossStreak || 0) >= 2 ? 'weakest' : 'equal',
     });
     if (!target || target.gid == null) return;
+    if ((this._gidCooldowns?.get(target.gid) || 0) > Date.now()) return;
 
     // Navigate next to the mob before engaging (engage is range-limited).
     if (this.heroCell != null && this.mapData) {
@@ -784,6 +807,8 @@ export class Agent {
     this.inFight = true;
     this._placed = false;
     this._fightStartHp = null;
+    this._engageAt = Date.now();
+    this._lastEngageGid = target.gid;
     this._engagedMid = target.id;
     this._guardedSend('engageFight', { gid: target.gid }); // engage uses gid, not mid
   }
