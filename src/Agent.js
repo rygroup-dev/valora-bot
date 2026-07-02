@@ -53,6 +53,11 @@ const COMBAT_WEAPON = 'iron_sword';
 // Which map a resource lives on (for cross-map quest gathering).
 const RESOURCE_MAP = (id) => (id.startsWith('ore_') ? 'mine1' : null);
 const HOME_MAP = 'city'; // broker/HDV/most quest givers live here
+// City fountain (RE'd from the live bundle: CENTER_CELL 9618, rest REACH 10).
+// rest_start is denied with `too_far` unless the hero stands near it.
+const FOUNTAIN_CELL = 9618;
+// Quest inspectables with fixed cells (RE'd from the live bundle).
+const INSPECTABLE_CELLS = { field_sack: 12519, fountain_bench: 9166 };
 const ROOM_STALE_MS = 8 * 60 * 1000;
 // Armor pieces that occupy their own slots (equip once, permanent).
 const ARMOR_ITEMS = ['oak_shield', 'travel_cape', 'enchanted_hat'];
@@ -800,13 +805,17 @@ export class Agent {
     }
   }
 
-  _doRest() {
+  async _doRest() {
     const now = Date.now();
+    if (this.walking) return;
     if (!this._restingSince) {
+      // Resting only works near the city fountain (server denies `too_far`).
+      if (this.mapId !== HOME_MAP && !(await this._ensureHome())) return;
+      if (!(await this._gotoNear(FOUNTAIN_CELL, 6))) return;
       this._restingSince = now;
       this._lastRestTickAt = 0;
       this._lastRestSendAt = now;
-      this._event(`🛌 resting to recover HP (${this._hp ?? '?'}/${this._maxHp ?? '?'})…`, { notify: true });
+      this._event(`🛌 resting at the fountain (${this._hp ?? '?'}/${this._maxHp ?? '?'})…`, { notify: true });
       return this._guardedSend('rest_start', {});
     }
     // No rest tick at all → the rest isn't running; fall back to food for a while.
@@ -1451,10 +1460,15 @@ export class Agent {
       return this._guardedSend('econ_quest_turnin', { questId: sa.questId, step: sa.step });
     }
     if (sa.type === 'equip') return this._equipTool();
-    // inspect / reach targets aren't in the map data yet — try a turn-in, then
-    // skip the quest if it won't advance so other quests can proceed.
+    // inspect / reach: walk to the inspectable's cell when we know it (RE'd
+    // from the bundle), then turn in on-site; skip the quest if it won't advance.
     if (sa.type === 'inspect' || sa.type === 'reach') {
-      if (!this._bumpStepTries(sa, 3)) return this._blockQuest(sa.questId, `${sa.type} unsupported`);
+      const cell = INSPECTABLE_CELLS[sa.target];
+      if (cell != null && !(await this._gotoNear(cell, 3))) {
+        if (!this._bumpStepTries(sa, 6)) return this._blockQuest(sa.questId, `${sa.type} target unreachable`);
+        return;
+      }
+      if (!this._bumpStepTries(sa, cell != null ? 6 : 3)) return this._blockQuest(sa.questId, `${sa.type} unsupported`);
       return this._guardedSend('econ_quest_turnin', { questId: sa.questId, step: sa.step });
     }
   }
